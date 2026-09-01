@@ -34,7 +34,7 @@ class Tracking:
         self.state = "NOT_INITIALIZED"
         self.last_frame = None
         self.last_keyframe = None
-        self.velocity = None              # 4x4 relative motion, for the motion model
+        self.velocity = None            # 4x4 relative motion, for the motion model
         self.frames_since_keyframe = 0
 
         self.min_matches_for_pose = min_matches_for_pose
@@ -67,6 +67,11 @@ class Tracking:
             # update motion model: velocity = current * inverse(last)
             if self.last_frame is not None and self.last_frame.pose is not None:
                 self.velocity = frame.pose @ np.linalg.inv(self.last_frame.pose)
+                # Diagnostic: Print out frame-to-frame motion delta
+                trans_vector = self.velocity[:3, 3]
+                trans_dist = np.linalg.norm(trans_vector)
+                print(f"[TRACK] Frame {frame.id} Motion -> Trans: [{trans_vector[0]:.3f}, {trans_vector[1]:.3f}, {trans_vector[2]:.3f}] (Dist: {trans_dist:.3f}m)")
+
             self.last_frame = frame
             self.frames_since_keyframe += 1
         else:
@@ -142,6 +147,9 @@ class Tracking:
             pts_3d, pts_2d, self.camera.K, None,
             iterationsCount=200, reprojectionError=3.0,
             confidence=0.99, flags=cv2.SOLVEPNP_ITERATIVE)
+
+        inlier_count = len(inliers) if (inliers is not None) else 0
+        print(f"[TRACK] Frame {frame.id}: Raw Matches={len(matches)}, RANSAC Inliers={inlier_count}")
 
         if not ok or inliers is None or len(inliers) < self.min_matches_for_pose:
             return False
