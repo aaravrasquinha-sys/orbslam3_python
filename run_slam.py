@@ -141,9 +141,9 @@ class SLAMSystem:
             self.stats['points_culled'] += n_culled
 
             n_kf = world_map.n_keyframes()
-            if n_kf >= 3:
-                local_bundle_adjust(world_map, self.camera, window=5,
-                                    verbose=self.verbose)
+            #if n_kf >= 3:
+               # local_bundle_adjust(world_map, self.camera, window=5,
+                        #            verbose=self.verbose)
 
             # ── loop closing ─────────────────────────────────────────────
             if n_kf % 10 == 0 and n_kf >= 20:
@@ -175,7 +175,7 @@ class SLAMSystem:
 
         c = np.array([p[:3, 3] for p in poses])
         kf_c = np.array([kf.camera_center() for m in self.atlas.maps
-                         for kf in m.keyframes if kf.pose is not None])
+                            for kf in m.keyframes if kf.pose is not None])
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
         for ax, (i, j), (xl, yl), title in (
@@ -267,12 +267,15 @@ def run_realsense(args):
     align = rs.align(rs.stream.color)
 
     profile = pipeline.start(config)
-    print(f"\nStreaming for {args.seconds}s — walk slowly, "
-          f"return to your start point to test loop closure.\n")
+    print(f"\nStreaming at {args.fps} FPS. Capturing exactly 30 target frames (1 per second).\n")
 
     t0 = time.time()
+    processed_count = 0
+    frame_counter = 0
+    skip_interval = 1  # process 6 frames per second for smoother tracking
+
     try:
-        while time.time() - t0 < args.seconds:
+        while processed_count < 30:
             frames = pipeline.wait_for_frames()
             frames = align.process(frames)
             color = frames.get_color_frame()
@@ -280,9 +283,17 @@ def run_realsense(args):
             if not color:
                 continue
 
+            frame_counter += 1
+            if frame_counter % skip_interval != 0:
+                continue
+
             color_img = np.asanyarray(color.get_data())
             depth_img = np.asanyarray(depth.get_data()) if (depth and not args.mono) else None
+            
+            processed_count += 1
+            print(f"Processing target frame {processed_count}/30")
             slam.process(color_img, time.time() - t0, depth_image=depth_img)
+            
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
