@@ -2,8 +2,8 @@
 bundle_adjust.py — local bundle adjustment.
 
 Maps to: ORB_SLAM3/src/Optimizer.cc
-  LocalBundleAdjustment -> local_bundle_adjust()
-  PoseOptimization      -> pose_only_optimize()
+   LocalBundleAdjustment -> local_bundle_adjust()
+   PoseOptimization      -> pose_only_optimize()
 
 SIMPLIFICATION: real ORB-SLAM3 uses g2o (sparse Levenberg-Marquardt on SE3/Sim3
 manifolds, robust Huber kernels, Schur-complement marginalisation). We use
@@ -41,7 +41,7 @@ def _project(K, pose_cw, p_world):
     return np.array([u, v])
 
 
-def local_bundle_adjust(world_map, camera, window=5, max_iter=30, verbose=False):
+def local_bundle_adjust(world_map, camera, window=3, max_iter=10, verbose=False):
     """
     Jointly refine the last `window` keyframes' poses and the 3D points they
     observe. The OLDEST keyframe in the window is held fixed as the anchor —
@@ -102,13 +102,16 @@ def local_bundle_adjust(world_map, camera, window=5, max_iter=30, verbose=False)
         for k, (ki, pid, obs) in enumerate(observations):
             proj = _project(camera.K, poses_cw[ki], pts[pid])
             if proj is None:
-                res[2 * k:2 * k + 2] = 100.0     # heavy penalty, behind camera
+                res[2 * k:2 * k + 2] = 100.0    # heavy penalty, behind camera
             else:
                 res[2 * k:2 * k + 2] = proj - obs
         return res
 
     before = float(np.sum(residuals(x0) ** 2))
-    result = least_squares(residuals, x0, method='lm', max_nfev=max_iter * len(x0))
+    try:
+        result = least_squares(residuals, x0, method='trf', max_nfev=max_iter * len(x0))
+    except ValueError:
+        result = least_squares(residuals, x0, method='lm', max_nfev=max_iter * len(x0))
     after = float(np.sum(result.fun ** 2))
 
     # write back
@@ -155,6 +158,9 @@ def pose_only_optimize(frame, world_map, camera, max_iter=20):
             res[2 * k:2 * k + 2] = (proj - px) if proj is not None else 100.0
         return res
 
-    result = least_squares(residuals, x0, method='lm', max_nfev=max_iter * 6)
+    try:
+        result = least_squares(residuals, x0, method='trf', max_nfev=max_iter * 6)
+    except ValueError:
+        result = least_squares(residuals, x0, method='lm', max_nfev=max_iter * 6)
     frame.set_pose(np.linalg.inv(_vec_to_pose(result.x)))
     return True
