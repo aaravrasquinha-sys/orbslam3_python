@@ -32,22 +32,25 @@ def init_rgbd(frame, world_map, min_points=100):
         return False, []
 
     frame.set_pose(np.eye(4))
+    world_map.add_keyframe(frame)   # assigns frame.kf_seq before points reference it
 
     new_points = []
     for i in range(frame.n):
         p3d = frame.unproject_keypoint(i)
         if p3d is None:
             continue
-        mp = MapPoint(p3d, frame.descriptors[i], ref_keyframe_id=frame.id)
+        mp = MapPoint(p3d, frame.descriptors[i], ref_keyframe_id=frame.kf_seq)
         mp.add_observation(frame.id, i)
         frame.map_point_ids[i] = mp.id
         world_map.add_map_point(mp)
         new_points.append(mp)
 
     if len(new_points) < min_points:
+        world_map.erase_keyframe(frame)
+        for mp in new_points:
+            world_map.erase_map_point(mp)
         return False, []
 
-    world_map.add_keyframe(frame)
     return True, new_points
 
 
@@ -88,6 +91,8 @@ def init_monocular(frame_a, frame_b, matcher, camera, world_map,
     T_ba[:3, 3] = t.flatten()
     frame_a.set_pose(np.eye(4))
     frame_b.set_pose(np.linalg.inv(T_ba))
+    world_map.add_keyframe(frame_a)   # assigns kf_seq before points reference it
+    world_map.add_keyframe(frame_b)
 
     # Triangulate: projection matrices are world-to-camera
     P_a = camera.K @ np.eye(3, 4)
@@ -106,7 +111,7 @@ def init_monocular(frame_a, frame_b, matcher, camera, world_map,
         if p[2] <= 0:          # must be in front of the first camera
             continue
 
-        mp = MapPoint(p, frame_a.descriptors[m.queryIdx], ref_keyframe_id=frame_a.id)
+        mp = MapPoint(p, frame_a.descriptors[m.queryIdx], ref_keyframe_id=frame_a.kf_seq)
         mp.add_observation(frame_a.id, m.queryIdx)
         mp.add_observation(frame_b.id, m.trainIdx)
         frame_a.map_point_ids[m.queryIdx] = mp.id
@@ -115,6 +120,10 @@ def init_monocular(frame_a, frame_b, matcher, camera, world_map,
         new_points.append(mp)
 
     if len(new_points) < min_matches * 0.3:
+        world_map.erase_keyframe(frame_a)
+        world_map.erase_keyframe(frame_b)
+        for mp in new_points:
+            world_map.erase_map_point(mp)
         return False, []
 
     # Normalise scale so median depth = 1.0 (CreateInitialMapMonocular does this).
@@ -129,6 +138,4 @@ def init_monocular(frame_a, frame_b, matcher, camera, world_map,
         pose_b[:3, 3] *= s
         frame_b.set_pose(pose_b)
 
-    world_map.add_keyframe(frame_a)
-    world_map.add_keyframe(frame_b)
     return True, new_points

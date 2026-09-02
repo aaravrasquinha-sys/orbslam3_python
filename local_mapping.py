@@ -5,36 +5,73 @@ Maps to: ORB_SLAM3/src/LocalMapping.cc
   ProcessNewKeyFrame  -> process_new_keyframe() step 1
   MapPointCulling     -> cull_recent_map_points()
   CreateNewMapPoints  -> _triangulate_new_points() / _create_points_from_depth()
-  KeyFrameCulling     -> (NOT implemented — flagged simplification)
-  SearchInNeighbors   -> (NOT implemented — no duplicate fusion)
+  KeyFrameCulling     -> cull_keyframes()
+  SearchInNeighbors   -> delegated to fusion.search_in_neighbors()
 """
 
 import cv2
 import numpy as np
 
 from map_point import MapPoint
+import covisibility
+import fusion
 
 
 class LocalMapping:
-    def __init__(self, camera, matcher, world_map,
+    def __init__(self, camera, matcher, world_map, extractor=None,
                  min_parallax_px=2.0, max_neighbors=5,
-                 culling_found_ratio=0.25, culling_min_obs=3):
+                 culling_found_ratio=0.25, culling_min_obs=3,
+                 max_new_points_per_kf=100,
+                 depth_min=0.3, depth_max=3.5,
+                 depth_patch_radius=2, depth_rel_std_max=0.02,
+                 kf_culling_redundancy=0.9, kf_culling_min_obs=3,
+                 kf_culling_min_map_size=5, kf_culling_protect_recent=3):
         self.camera = camera
         self.matcher = matcher
         self.map = world_map
+        self.extractor = extractor   # needed for scale_factor/n_levels (frustum + normals)
         self.min_parallax_px = min_parallax_px
         self.max_neighbors = max_neighbors
         self.culling_found_ratio = culling_found_ratio
         self.culling_min_obs = culling_min_obs
+
+        # ORB-SLAM3's rule for RGB-D point creation: cap how many new points
+        # a single keyframe can spawn, prioritise the closest (most
+        # reliable) depth, gate to a sane working range, and reject points
+        # sitting on a depth discontinuity (object edges -> flying points).
+        self.max_new_points_per_kf = max_new_points_per_kf
+        self.depth_min = depth_min
+        self.depth_max = depth_max
+        self.depth_patch_radius = depth_patch_radius
+        self.depth_rel_std_max = depth_rel_std_max
+
+        # KeyFrameCulling thresholds (LocalMapping::KeyFrameCulling)
+        self.kf_culling_redundancy = kf_culling_redundancy
+        self.kf_culling_min_obs = kf_culling_min_obs
+        self.kf_culling_min_map_size = kf_culling_min_map_size
+        self.kf_culling_protect_recent = kf_culling_protect_recent
+
+        # Covisibility graph: kf_id -> {neighbor_kf_id: shared_point_count}.
+        # Rebuilt in place (see covisibility.py) so Tracking can hold the
+        # same dict reference and always see the latest version.
+        self.covis_graph = {}
 
         self.recent_points = []   # mlpRecentAddedMapPoints — points on probation
 
     def set_map(self, world_map):
         self.map = world_map
         self.recent_points = []
+        self.covis_graph = {}
 
-    def process_new_keyframe(self, keyframe, use_depth=False):
-        """Full LocalMapping::Run() body for one keyframe."""
+    def process_new_keyframe(self, keyframe, use_depth=False, depth_image=None):
+        """
+        Full LocalMapping::Run() body for one keyframe.
+
+        depth_image: raw 16-bit depth frame for THIS keyframe, used only for
+        the local-patch variance gate in _create_points_from_depth. Passed
+        through rather than stored on Frame, so we don't retain a ~600KB
+        array per frame for the lifetime of a facility-length run.
+        """
         self.map.add_keyframe(keyframe)
 
         # 1. link existing observations
@@ -50,7 +87,7 @@ class LocalMapping:
 
         # 3. create new points
         if use_depth:
-            new_points = self._create_points_from_depth(keyframe)
+            new_points = self._create_points_from_depth(keyframe, depth_image=depth_image)
         else:
             new_points = self._triangulate_new_points(keyframe)
 
@@ -58,7 +95,37 @@ class LocalMapping:
             self.map.add_map_point(mp)
             self.recent_points.append(mp)
 
-        return new_points, n_culled
+        # 4. covisibility graph (needed by fusion below AND by Tracking's
+        #    local-map matching -- see covisibility.py / tracking.py).
+        #    Built from the state right after new points were added; fusion
+        #    below will change observations again, so we rebuild once more
+        #    at the end to hand Tracking a fully up-to-date graph.
+        covisibility.build_covisibility_graph(self.map, graph=self.covis_graph)
+
+        # 5. SearchInNeighbors: fuse duplicate points against covisible
+        #    neighbors. This is what turns the RGB-D duplicate-cloud problem
+        #    into a proper landmark set, and is what manufactures the
+        #    >=2-observation points bundle_adjust.py's windowed BA needs.
+        n_levels = self.extractor.nlevels if self.extractor else 8
+        scale_factor = self.extractor.scale_factor if self.extractor else 1.2
+        n_fused = fusion.search_in_neighbors(
+            keyframe, self.map, self.covis_graph, self.camera,
+            n_levels=n_levels, scale_factor=scale_factor)
+
+        # 6. refresh normal/depth invariance for points this keyframe (and
+        #    its neighbors) touched, and rebuild the graph one more time so
+        #    it reflects the fused observations.
+        kf_by_id = {kf.id: kf for kf in self.map.keyframes}
+        scale_factors = self.extractor.scale_factors if self.extractor else \
+            [scale_factor ** i for i in range(n_levels)]
+        touched_ids = set(mp_id for mp_id in keyframe.map_point_ids if mp_id is not None)
+        for mp_id in touched_ids:
+            mp = self.map.map_points.get(mp_id)
+            if mp is not None and not mp.is_bad:
+                mp.update_normal_and_depth(kf_by_id, scale_factors)
+        covisibility.build_covisibility_graph(self.map, graph=self.covis_graph)
+
+        return new_points, n_culled, n_fused
 
     # ── MapPointCulling ──────────────────────────────────────────────────
 
@@ -68,12 +135,19 @@ class LocalMapping:
         re-detected, or if they never accumulated enough observations.
         """
         survivors, n_culled = [], 0
+        # BUGFIX: age must count KEYFRAMES, not frames. current_keyframe.id
+        # and mp.first_keyframe_id used to be Frame.id, which increments on
+        # every processed frame -- with keyframe_max_frames=20 a point's
+        # "age" could leap straight past the >=2 / >=3 thresholds the
+        # moment the NEXT keyframe was created, so probation barely ran.
+        # kf_seq (assigned in Map.add_keyframe) counts actual keyframes.
+        cur_seq = current_keyframe.kf_seq if current_keyframe.kf_seq is not None else 0
         for mp in self.recent_points:
             if mp.is_bad:
                 n_culled += 1
                 continue
 
-            age = current_keyframe.id - (mp.first_keyframe_id or 0)
+            age = cur_seq - (mp.first_keyframe_id or 0)
 
             if mp.found_ratio() < self.culling_found_ratio:
                 mp.set_bad()
@@ -90,22 +164,122 @@ class LocalMapping:
         self.map.clean_bad_points()
         return n_culled
 
-    # ── RGB-D point creation ─────────────────────────────────────────────
+    # ── KeyFrameCulling ──────────────────────────────────────────────────
 
-    def _create_points_from_depth(self, keyframe):
-        """Depth available: unproject unmatched keypoints directly. No parallax needed."""
-        new_points = []
+    def cull_keyframes(self):
+        """
+        LocalMapping::KeyFrameCulling(): drop a keyframe when almost all of
+        its points are already well-covered by other keyframes -- it's not
+        adding information, just cost (to every future covisibility
+        rebuild, BA window, and local-map match). Never implemented before;
+        without it a facility-length walk accumulates keyframes forever.
+
+        A keyframe is redundant if >= kf_culling_redundancy (90%) of its
+        good map points are each observed by >= kf_culling_min_obs (3)
+        OTHER keyframes. The most recent few keyframes are protected so we
+        never cull something still actively anchoring local tracking/BA.
+        """
+        if self.map.n_keyframes() < self.kf_culling_min_map_size:
+            return 0
+
+        ordered = sorted((kf for kf in self.map.keyframes if kf.kf_seq is not None),
+                         key=lambda kf: kf.kf_seq)
+        protected_ids = {kf.id for kf in ordered[-self.kf_culling_protect_recent:]}
+
+        to_cull = []
+        for kf in ordered:
+            if kf.id in protected_ids:
+                continue
+            obs_points = [mp_id for mp_id in kf.map_point_ids if mp_id is not None]
+            good = [self.map.map_points[mp_id] for mp_id in obs_points
+                   if mp_id in self.map.map_points and not self.map.map_points[mp_id].is_bad]
+            if len(good) < 20:      # too few points to judge either way -- keep it
+                continue
+            n_redundant = sum(1 for mp in good if mp.n_observations() >= self.kf_culling_min_obs)
+            if n_redundant / len(good) >= self.kf_culling_redundancy:
+                to_cull.append(kf)
+
+        for kf in to_cull:
+            for mp_id in kf.map_point_ids:
+                if mp_id is None:
+                    continue
+                mp = self.map.map_points.get(mp_id)
+                if mp is not None:
+                    mp.erase_observation(kf.id)
+            self.map.erase_keyframe(kf)
+
+        if to_cull:
+            self.map.clean_bad_points()
+            covisibility.build_covisibility_graph(self.map, graph=self.covis_graph)
+        return len(to_cull)
+
+    def _create_points_from_depth(self, keyframe, depth_image=None):
+        """
+        Depth available: unproject unmatched keypoints directly. No parallax
+        needed.
+
+        Was previously unbounded -- ~1000 new points created per keyframe,
+        forever, with no fusion against existing points (SearchInNeighbors
+        is a separate, not-yet-implemented piece), so the same physical
+        landmark got recreated at every keyframe and the map grew without
+        bound. That flood of near-duplicate, mostly-single-observation
+        points was also the single biggest contributor to the BA hang: a
+        point seen once contributes 2 residuals but 3 free unknowns, so
+        thousands of them made the old dense solver wander through a
+        rank-deficient null space.
+
+        Fix, following ORB-SLAM3's own rule: cap new points per keyframe,
+        create closest-depth-first, gate to a working depth range, and
+        reject points sitting on a depth discontinuity (a median/std check
+        over a small patch -- this is what kills "flying points" at object
+        edges, the classic RGB-D artifact).
+        """
+        candidates = []
         for i in range(keyframe.n):
             if keyframe.map_point_ids[i] is not None:
                 continue
+            z = keyframe.depths[i]
+            if z <= 0 or z < self.depth_min or z > self.depth_max:
+                continue
+            if depth_image is not None and not self._depth_patch_ok(keyframe, depth_image, i, z):
+                continue
+            candidates.append((z, i))
+
+        # closest first -- nearer depth is more reliable on this sensor
+        candidates.sort(key=lambda t: t[0])
+        candidates = candidates[:self.max_new_points_per_kf]
+
+        new_points = []
+        for _, i in candidates:
             p3d = keyframe.unproject_keypoint(i)
             if p3d is None:
                 continue
-            mp = MapPoint(p3d, keyframe.descriptors[i], ref_keyframe_id=keyframe.id)
+            mp = MapPoint(p3d, keyframe.descriptors[i], ref_keyframe_id=keyframe.kf_seq)
             mp.add_observation(keyframe.id, i)
             keyframe.map_point_ids[i] = mp.id
             new_points.append(mp)
         return new_points
+
+    def _depth_patch_ok(self, keyframe, depth_image, kp_idx, center_depth):
+        """
+        Sample a small window around the keypoint in the raw depth image and
+        reject if local depth variance is high relative to the depth itself
+        -- i.e. the keypoint sits on a depth discontinuity (an object edge)
+        rather than a flat surface, which is where RGB-D "flying points"
+        come from.
+        """
+        kp = keyframe.keypoints[kp_idx]
+        u, v = int(round(kp.pt[0])), int(round(kp.pt[1]))
+        r = self.depth_patch_radius
+        h, w = depth_image.shape[:2]
+        u0, u1 = max(0, u - r), min(w, u + r + 1)
+        v0, v1 = max(0, v - r), min(h, v + r + 1)
+        patch = depth_image[v0:v1, u0:u1].astype(np.float64) * self.camera.depth_scale
+        valid = patch[patch > 0]
+        if valid.size < 3:
+            return False
+        rel_std = float(np.std(valid)) / max(center_depth, 1e-6)
+        return rel_std <= self.depth_rel_std_max
 
     # ── monocular triangulation ──────────────────────────────────────────
 
@@ -168,7 +342,7 @@ class LocalMapping:
                 if keyframe.map_point_ids[ci] is not None:
                     continue
 
-                mp = MapPoint(p, keyframe.descriptors[ci], ref_keyframe_id=keyframe.id)
+                mp = MapPoint(p, keyframe.descriptors[ci], ref_keyframe_id=keyframe.kf_seq)
                 mp.add_observation(keyframe.id, ci)
                 mp.add_observation(neigh.id, ni)
                 keyframe.map_point_ids[ci] = mp.id

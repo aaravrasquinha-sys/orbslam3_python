@@ -1,0 +1,12 @@
+# NOTE: your environment currently has BOTH opencv-python and
+# opencv-contrib-python installed at the same version (5.0.0.93). That's a
+# known conflict source (they both provide the `cv2` module and can shadow
+# each other's builds unpredictably depending on import order / wheel
+# resolution). Keep contrib only:
+#   pip uninstall opencv-python
+opencv-contrib-python
+numpy
+scipy
+pyyaml
+matplotlib
+pyrealsense2

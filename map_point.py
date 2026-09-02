@@ -34,6 +34,56 @@ class MapPoint:
         self.is_bad = False
         self.first_keyframe_id = ref_keyframe_id
 
+        # Visibility invariance (MapPoint::UpdateNormalAndDepth / mNormalVector,
+        # mfMinDistance, mfMaxDistance). Used by covisibility.is_in_frustum()
+        # to reject points that can't plausibly be visible from a given pose
+        # before spending a match attempt on them. None until the first call
+        # to update_normal_and_depth().
+        self.normal_vector = None
+        self.min_distance = 0.0
+        self.max_distance = float("inf")
+
+    def update_normal_and_depth(self, keyframes_by_id, scale_factors):
+        """
+        MapPoint::UpdateNormalAndDepth(): recompute the mean viewing direction
+        across every keyframe that observes this point, and the scale-
+        invariance distance range (min/max distance at which this point's
+        descriptor octave is still expected to match).
+
+        keyframes_by_id: dict kf_id -> Frame, for every id in self.observations
+        scale_factors:   Extractor.scale_factors (per-octave scale multipliers)
+        """
+        if not self.observations:
+            return
+        centers, dists = [], []
+        ref_kf, ref_kp_idx, ref_dist = None, None, None
+        for kf_id, kp_idx in self.observations.items():
+            kf = keyframes_by_id.get(kf_id)
+            if kf is None or kf.pose is None:
+                continue
+            c = kf.camera_center()
+            d = self.position - c
+            dist = float(np.linalg.norm(d))
+            if dist <= 1e-9:
+                continue
+            centers.append(d / dist)
+            dists.append(dist)
+            if kf_id == self.first_keyframe_id or ref_kf is None:
+                ref_kf, ref_kp_idx, ref_dist = kf, kp_idx, dist
+
+        if not centers:
+            return
+        normal = np.mean(centers, axis=0)
+        n = np.linalg.norm(normal)
+        self.normal_vector = normal / n if n > 1e-9 else normal
+
+        if ref_dist is not None and ref_kf is not None:
+            octave = ref_kf.keypoints[ref_kp_idx].octave if ref_kp_idx < len(ref_kf.keypoints) else 0
+            level_scale = scale_factors[min(octave, len(scale_factors) - 1)]
+            max_scale = scale_factors[-1]
+            self.max_distance = ref_dist * level_scale
+            self.min_distance = self.max_distance / max_scale
+
     def add_observation(self, frame_id, keypoint_idx):
         self.observations[frame_id] = keypoint_idx
 

@@ -29,6 +29,15 @@ class Map:
     def add_keyframe(self, frame):
         frame.is_keyframe = True
         if frame not in self.keyframes:
+            # BUGFIX: previously nothing tracked "how many keyframes have
+            # there been", so local_mapping.py used Frame.id (which counts
+            # every processed frame, keyframe or not) to compute a point's
+            # age. With keyframe_max_frames=20, a point could see its age
+            # jump by ~20 in a single step -- the >=2 / >=3 probation
+            # thresholds in cull_recent_map_points() fired almost the
+            # instant a point was created, so the probation logic barely
+            # ran. kf_seq increments once per ACTUAL keyframe.
+            frame.kf_seq = len(self.keyframes)
             self.keyframes.append(frame)
 
     def erase_keyframe(self, frame):
