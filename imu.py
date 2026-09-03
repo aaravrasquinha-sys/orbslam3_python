@@ -88,7 +88,7 @@ def load_imu_csv(path):
             xyz = [float(row["x"]), float(row["y"]), float(row["z"])]
             (accel if row["stream"] == "accel" else gyro).append([t] + xyz)
     return {"accel": np.asarray(accel, dtype=np.float64).reshape(-1, 4),
-           "gyro": np.asarray(gyro, dtype=np.float64).reshape(-1, 4)}
+            "gyro": np.asarray(gyro, dtype=np.float64).reshape(-1, 4)}
 
 
 def synchronize(imu_data, R_cam_imu=None):
@@ -139,7 +139,7 @@ class Preintegration:
     """
     Forster et al. (2015) on-manifold IMU preintegration between two
     keyframes. Accumulates one sample at a time via integrate_sample();
-    query the running (dR, dv, dp, dt) at any point (it's a valid partial
+    query the running (ΔR, Δv, Δp, Δt) at any point (it's a valid partial
     preintegration, which is what lets tracking.py use this same object for
     per-frame pose prediction before the segment is finalized at the next
     keyframe -- see run_slam.py).
@@ -148,8 +148,8 @@ class Preintegration:
     def __init__(self, bias_gyro, bias_accel, noise_gyro=1.7e-2, noise_accel=2.0e-2):
         self.bias_gyro = np.asarray(bias_gyro, dtype=np.float64).copy()
         self.bias_accel = np.asarray(bias_accel, dtype=np.float64).copy()
-        self.noise_gyro = noise_gyro     # rad/s / sqrt(Hz) -- BMI085 datasheet fallback
-        self.noise_accel = noise_accel   # m/s^2 / sqrt(Hz)
+        self.noise_gyro = noise_gyro    # rad/s / sqrt(Hz) -- BMI085 datasheet fallback
+        self.noise_accel = noise_accel  # m/s^2 / sqrt(Hz)
 
         self.dR = np.eye(3)
         self.dv = np.zeros(3)
@@ -193,6 +193,10 @@ class Preintegration:
         self.dt += dt
         self.n_samples += 1
 
+    def integrate(self, gyro, accel, dt):
+        """Compatibility wrapper used by run_slam.py."""
+        return self.integrate_sample(gyro, accel, dt)
+
     def integrate_span(self, sync_samples, t_start, t_end):
         """Integrate every synchronized sample with t_start < t <= t_end."""
         rows = slice_between(sync_samples, t_start, t_end)
@@ -206,7 +210,7 @@ class Preintegration:
         """
         First-order bias correction (Forster eq. 44): if the bias estimate
         changes by (delta_bg, delta_ba) since this was integrated, correct
-        (dR, dv, dp) via the stored Jacobians instead of re-integrating from
+        (ΔR, Δv, Δp) via the stored Jacobians instead of re-integrating from
         raw samples.
         """
         dR_corr = self.dR @ exp_so3(self.dR_dbg @ delta_bg)
@@ -235,5 +239,5 @@ class Preintegration:
         sigma_v = self.noise_accel * np.sqrt(max(self.dt, 1e-3))
         sigma_p = 0.5 * self.noise_accel * max(self.dt, 1e-3) ** 1.5
         return (min(1.0 / max(sigma_r, 1e-6), max_weight),
-               min(1.0 / max(sigma_v, 1e-6), max_weight),
-               min(1.0 / max(sigma_p, 1e-6), max_weight))
+                min(1.0 / max(sigma_v, 1e-6), max_weight),
+                min(1.0 / max(sigma_p, 1e-6), max_weight))
