@@ -60,11 +60,7 @@ def observability_gate(sync_samples, t_start, t_end,
 
 def _estimate_gyro_bias(keyframes):
     """
-    Stage 1: solve for a single gyro bias delta that best aligns each
-    preintegrated ΔR with the visual relative rotation between consecutive
-    keyframe poses. Linear in delta_bg via the ΔR/∂bg Jacobian -- nearly
-    linear, converges in one solve (Forster eq. 24 / ORB-SLAM3's
-    InitializeIMU rotation-only stage).
+    Stage 1: Solve for gyro bias delta aligning preintegrated dR with visual relative rotation.
     """
     A_rows, b_rows = [], []
     for i in range(1, len(keyframes)):
@@ -89,21 +85,10 @@ def _estimate_gyro_bias(keyframes):
 
 def _estimate_gravity_bias_velocities(keyframes, bias_gyro, gravity_mag=9.81):
     """
-    Stage 2: linear least squares for gravity direction (as a 3-vector,
-    renormalized to gravity_mag afterward), accel bias, and per-keyframe
-    velocity, given the (now gyro-bias-corrected) preintegrated ΔR/Δv/Δp
-    and the visual poses. Scale is fixed to 1 (RGB-D) so it's dropped from
-    the unknowns entirely -- this is the main thing that makes this stage
-    reliable compared to the monocular version of the same problem.
-
-    Unknowns: v_0 .. v_{n-1} (3 each), g (3), ba (3).
-    Per consecutive pair (i, i+1), two vector equations (6 rows):
-      R_i^T (p_{i+1} - p_i - v_i*dt) - 0.5*g*dt^2  - dp_dba@ba ==  dp_meas
-      R_i^T (v_{i+1} - v_i)          - g*dt        - dv_dba@ba ==  dv_meas
-    rearranged into A @ x = b.
+    Stage 2: Solve for velocities, gravity, and accel bias using direct kinematic equations.
     """
     n = len(keyframes)
-    n_unknowns = n * 3 + 3 + 3   # velocities + gravity + accel bias
+    n_unknowns = n * 3 + 3 + 3
     rows_A, rows_b = [], []
 
     def vel_cols(i):
@@ -121,24 +106,24 @@ def _estimate_gravity_bias_velocities(keyframes, bias_gyro, gravity_mag=9.81):
         R_i = kf_i.pose[:3, :3]
         p_i, p_j = kf_i.pose[:3, 3], kf_j.pose[:3, 3]
 
-        dR_corr, dv_meas, dp_meas = preint.corrected(bias_gyro - preint.bias_gyro, np.zeros(3))
+        _, dv_raw, dp_raw = preint.corrected(bias_gyro - preint.bias_gyro, np.zeros(3))
 
-        # position equation
+        # Position equation: p_j = p_i + v_i*dt + 0.5*g*dt^2 + R_i @ dp
         A_p = np.zeros((3, n_unknowns))
-        A_p[:, vel_cols(i)] = -R_i.T * dt
-        A_p[:, g_cols] = -0.5 * R_i.T * dt ** 2
-        A_p[:, ba_cols] = -preint.dp_dba
-        b_p = dp_meas - R_i.T @ (p_j - p_i)
+        A_p[:, vel_cols(i)] = dt * np.eye(3)
+        A_p[:, g_cols] = 0.5 * (dt ** 2) * np.eye(3)
+        A_p[:, ba_cols] = R_i @ preint.dp_dba
+        b_p = p_j - p_i - R_i @ dp_raw
         rows_A.append(A_p)
         rows_b.append(b_p)
 
-        # velocity equation
+        # Velocity equation: v_{i+1} = v_i + g*dt + R_i @ dv
         A_v = np.zeros((3, n_unknowns))
-        A_v[:, vel_cols(i)] = -R_i.T
-        A_v[:, vel_cols(i + 1)] = R_i.T
-        A_v[:, g_cols] = -R_i.T * dt
-        A_v[:, ba_cols] = -preint.dv_dba
-        b_v = dv_meas
+        A_v[:, vel_cols(i)] = -np.eye(3)
+        A_v[:, vel_cols(i + 1)] = np.eye(3)
+        A_v[:, g_cols] = -dt * np.eye(3)
+        A_v[:, ba_cols] = R_i @ preint.dv_dba
+        b_v = R_i @ dv_raw
         rows_A.append(A_v)
         rows_b.append(b_v)
 
