@@ -97,6 +97,10 @@ class SLAMSystem:
         """
         frame = Frame(image, timestamp, self.camera, self.extractor,
                       depth_image=depth_image)
+        
+        # ── Diagnostic output immediately after creating each Frame ──
+        print(f"[RGBD] Frame {frame.id}: keypoints={len(frame.keypoints)}, valid_depth={getattr(frame, 'valid_depth_count', 0)}")
+
         self.frames.append(frame)
         world_map = self.atlas.active_map
 
@@ -106,7 +110,7 @@ class SLAMSystem:
         # ── initialisation ───────────────────────────────────────────────
         if self.tracking.state == "NOT_INITIALIZED":
             if self.use_depth:
-                ok, new_pts = initializer.init_rgbd(frame, world_map)
+                ok, new_pts, fail_reason = initializer.init_rgbd(frame, world_map)
                 if ok:
                     self.tracking.state = "OK"
                     self.tracking.last_frame = frame
@@ -119,6 +123,8 @@ class SLAMSystem:
                         self._start_imu_segment()
                     self._log(f"[init] RGB-D success at frame {frame.id} "
                               f"({len(new_pts)} points)")
+                else:
+                    self._log(f"[init] RGB-D failed at frame {frame.id}: {fail_reason}")
             else:
                 if self.init_candidate is None:
                     self.init_candidate = frame
@@ -164,7 +170,7 @@ class SLAMSystem:
             elapsed_lost = timestamp - self.last_ok_timestamp if self.last_ok_timestamp is not None else 0.0
             if self.use_imu and self.tracking.imu_initialized:
                 give_up = (elapsed_lost >= self.cfg["imu"]["recently_lost_max_seconds"]
-                          and self.consecutive_lost >= 3)
+                           and self.consecutive_lost >= 3)
             else:
                 give_up = self.consecutive_lost >= 10
 
@@ -481,16 +487,16 @@ def run_realsense(args):
             depth_sensor.set_option(rs.option.emitter_on_off, 1)
             depth_sensor.set_option(rs.option.emitter_enabled, 1)
 
-    print(f"\nStreaming at {args.fps} FPS. Capturing exactly 30 target frames (1 per second).\n")
+    total_target_frames = args.fps * args.seconds
+    print(f"\nStreaming at {args.fps} FPS. Capturing approximately {total_target_frames} target frames ({args.fps} per second over {args.seconds} seconds).\n")
 
     t0 = time.time()
     processed_count = 0
     frame_counter = 0
-    skip_interval = 1  # process 6 frames per second for smoother tracking
     pending_ir_clean = None   # holds the last emitter-off IR frame while we wait for the paired depth
 
     try:
-        while processed_count < 30:
+        while processed_count < total_target_frames:
             frames = pipeline.wait_for_frames()
 
             if args.ir:
@@ -498,9 +504,6 @@ def run_realsense(args):
                 depth = frames.get_depth_frame()
                 if not ir:
                     continue
-                # emitter_on_off toggles per-frame: use the emitter METADATA
-                # to tell clean (ORB) frames from patterned (depth) frames,
-                # rather than assuming a fixed even/odd order.
                 try:
                     emitter_on = bool(ir.get_frame_metadata(
                         rs.frame_metadata_value.frame_laser_power_mode))
@@ -508,7 +511,6 @@ def run_realsense(args):
                     emitter_on = (frame_counter % 2 == 0)
 
                 if emitter_on:
-                    # patterned frame: good depth, skip for ORB, keep depth only
                     if pending_ir_clean is not None and depth:
                         color_img = pending_ir_clean
                         depth_img = np.asanyarray(depth.get_data()) if not args.mono else None
@@ -517,7 +519,6 @@ def run_realsense(args):
                         frame_counter += 1
                         continue
                 else:
-                    # clean frame: good for ORB, no usable depth this instant
                     pending_ir_clean = np.asanyarray(ir.get_data())
                     frame_counter += 1
                     continue
@@ -528,13 +529,11 @@ def run_realsense(args):
                 if not color:
                     continue
                 frame_counter += 1
-                if frame_counter % skip_interval != 0:
-                    continue
                 color_img = np.asanyarray(color.get_data())
                 depth_img = np.asanyarray(depth.get_data()) if (depth and not args.mono) else None
 
             processed_count += 1
-            print(f"Processing target frame {processed_count}/30")
+            print(f"Processing target frame {processed_count}/{total_target_frames}")
             slam.process(color_img, time.time() - t0, depth_image=depth_img)
 
     except KeyboardInterrupt:
