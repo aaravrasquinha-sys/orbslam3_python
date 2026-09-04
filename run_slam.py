@@ -38,6 +38,14 @@ from vocabulary import Vocabulary
 from loop_closing import LoopClosing
 import initializer
 from bundle_adjust import local_bundle_adjust, local_inertial_bundle_adjust, pose_only_optimize
+# Phase 2: GTSAM backend is optional -- only imported if config actually
+# requests it, so `gtsam` is not a hard dependency for anyone still on the
+# scipy backend. See bundle_adjust_gtsam.py's docstring for why this
+# exists and PROGRESS.md for the three bugs found verifying it.
+try:
+    from bundle_adjust_gtsam import local_bundle_adjust_gtsam
+except ImportError:
+    local_bundle_adjust_gtsam = None
 import imu
 import imu_init
 from config import load_config
@@ -258,12 +266,28 @@ class SLAMSystem:
                         bias_gyro=self.bias_gyro, bias_accel=self.bias_accel,
                         window=self.cfg["imu"]["ba_window"], verbose=self.verbose)
             elif n_kf >= 3:
-                local_bundle_adjust(world_map, self.camera,
-                                    window=self.cfg["bundle_adjust"]["window"],
-                                    max_iter=self.cfg["bundle_adjust"]["max_iter"],
-                                    min_obs_to_optimize=self.cfg["bundle_adjust"]["min_obs_to_optimize"],
-                                    huber_f_scale=self.cfg["bundle_adjust"]["huber_f_scale"],
-                                    verbose=self.verbose)
+                # Phase 2: pick the BA backend from config. GTSAM path
+                # falls back to scipy with a warning if gtsam isn't
+                # installed or config asks for it incorrectly -- never
+                # silently no-ops bundle adjustment entirely.
+                backend = self.cfg["bundle_adjust"].get("backend", "scipy")
+                if backend == "gtsam" and local_bundle_adjust_gtsam is not None:
+                    local_bundle_adjust_gtsam(world_map, self.camera,
+                                              window=self.cfg["bundle_adjust"]["window"],
+                                              max_iter=self.cfg["bundle_adjust"]["max_iter"],
+                                              min_obs_to_optimize=self.cfg["bundle_adjust"]["min_obs_to_optimize"],
+                                              huber_f_scale=self.cfg["bundle_adjust"]["huber_f_scale"],
+                                              verbose=self.verbose)
+                else:
+                    if backend == "gtsam" and self.verbose:
+                        print("[BA] config requested gtsam backend but gtsam "
+                             "is not installed -- falling back to scipy")
+                    local_bundle_adjust(world_map, self.camera,
+                                        window=self.cfg["bundle_adjust"]["window"],
+                                        max_iter=self.cfg["bundle_adjust"]["max_iter"],
+                                        min_obs_to_optimize=self.cfg["bundle_adjust"]["min_obs_to_optimize"],
+                                        huber_f_scale=self.cfg["bundle_adjust"]["huber_f_scale"],
+                                        verbose=self.verbose)
 
             # ── loop closing ─────────────────────────────────────────────
             if n_kf % 10 == 0 and n_kf >= 20:
