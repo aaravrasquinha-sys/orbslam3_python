@@ -168,16 +168,36 @@ class LocalMapping:
 
     def cull_keyframes(self):
         """
-        LocalMapping::KeyFrameCulling(): drop a keyframe when almost all of
-        its points are already well-covered by other keyframes -- it's not
-        adding information, just cost (to every future covisibility
-        rebuild, BA window, and local-map match). Never implemented before;
-        without it a facility-length walk accumulates keyframes forever.
+        LocalMapping::KeyFrameCulling(), corrected against three bugs found
+        during the Phase-1 forensic audit (see PROGRESS.md for the ablation
+        numbers): on a noise-free 60-frame synthetic sequence with zero
+        tracking losses, the ORIGINAL version of this function culled 14 of
+        20 keyframes (70%) and left ZERO map points in the entire map with
+        >=4 observations -- every landmark was destroyed before it could
+        mature, which is what produced the empty local maps, the "5 free +
+        1 fixed kfs" BA windows, and the eventual tracking collapse under
+        rotation. The three bugs, all biased toward over-culling:
 
-        A keyframe is redundant if >= kf_culling_redundancy (90%) of its
-        good map points are each observed by >= kf_culling_min_obs (3)
-        OTHER keyframes. The most recent few keyframes are protected so we
-        never cull something still actively anchoring local tracking/BA.
+          1. Redundancy was judged against the ENTIRE map
+             (self.map.keyframes), not the keyframe's own covisible
+             neighbors. A point can look "well covered" globally while
+             being poorly covered locally -- ORB-SLAM2 only ever compares a
+             keyframe against ITS OWN covisibility neighbors.
+          2. n_observations() counts the keyframe being judged too, so
+             kf_culling_min_obs=3 actually required only 2 OTHER observers
+             to call a point redundant -- one keyframe more than intended.
+             ORB-SLAM2's default is nObs>3 measured over OTHER keyframes,
+             i.e. >=4 other observers minimum.
+          3. No scale check: a point should only count as "redundant" via
+             another observer if that observer sees it at the same or a
+             FINER pyramid octave (a coarser-octave observation is a worse
+             view and doesn't actually make the point disposable at this
+             scale). Approximated here by comparing keypoint octaves.
+
+        A keyframe is redundant if >= kf_culling_redundancy of its good
+        points are each observed, at comparable-or-better scale, by >=
+        kf_culling_min_obs OTHER keyframes drawn from its own covisibility
+        neighbors. The most recent few keyframes stay protected.
         """
         if self.map.n_keyframes() < self.kf_culling_min_map_size:
             return 0
@@ -185,17 +205,47 @@ class LocalMapping:
         ordered = sorted((kf for kf in self.map.keyframes if kf.kf_seq is not None),
                          key=lambda kf: kf.kf_seq)
         protected_ids = {kf.id for kf in ordered[-self.kf_culling_protect_recent:]}
+        kf_by_id = {kf.id: kf for kf in self.map.keyframes}
 
         to_cull = []
         for kf in ordered:
             if kf.id in protected_ids:
                 continue
-            obs_points = [mp_id for mp_id in kf.map_point_ids if mp_id is not None]
-            good = [self.map.map_points[mp_id] for mp_id in obs_points
+
+            # BUGFIX #1: neighbors, not the whole map.
+            neighbor_ids = set(self.covis_graph.get(kf.id, {}).keys())
+            if not neighbor_ids:
+                continue   # isolated keyframe -- nothing to compare against, keep it
+
+            obs_points = [(kp_i, mp_id) for kp_i, mp_id in enumerate(kf.map_point_ids)
+                         if mp_id is not None]
+            good = [(kp_i, self.map.map_points[mp_id]) for kp_i, mp_id in obs_points
                    if mp_id in self.map.map_points and not self.map.map_points[mp_id].is_bad]
             if len(good) < 20:      # too few points to judge either way -- keep it
                 continue
-            n_redundant = sum(1 for mp in good if mp.n_observations() >= self.kf_culling_min_obs)
+
+            n_redundant = 0
+            for kp_i, mp in good:
+                my_octave = kf.keypoints[kp_i].octave if kp_i < len(kf.keypoints) else 0
+                # BUGFIX #2: count OTHER observers only, restricted to this
+                # keyframe's own covisibility neighbors (BUGFIX #1).
+                n_other = 0
+                for obs_kf_id, obs_kp_i in mp.observations.items():
+                    if obs_kf_id == kf.id or obs_kf_id not in neighbor_ids:
+                        continue
+                    obs_kf = kf_by_id.get(obs_kf_id)
+                    if obs_kf is None:
+                        continue
+                    # BUGFIX #3: only counts if seen at the same-or-finer scale.
+                    obs_octave = (obs_kf.keypoints[obs_kp_i].octave
+                                 if obs_kp_i < len(obs_kf.keypoints) else 0)
+                    if obs_octave <= my_octave:
+                        n_other += 1
+                        if n_other >= self.kf_culling_min_obs:
+                            break
+                if n_other >= self.kf_culling_min_obs:
+                    n_redundant += 1
+
             if n_redundant / len(good) >= self.kf_culling_redundancy:
                 to_cull.append(kf)
 
