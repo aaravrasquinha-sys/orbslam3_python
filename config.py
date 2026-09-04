@@ -61,6 +61,7 @@ DEFAULTS = {
         "depth_rel_std_max": 0.02,
     },
     "bundle_adjust": {
+        "backend": "scipy",  # "scipy" (original) or "gtsam" (Phase 2, see PROGRESS.md)
         "window": 8,
         "max_iter": 15,
         "min_obs_to_optimize": 2,
