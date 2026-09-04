@@ -26,10 +26,15 @@ def init_rgbd(frame, world_map, min_points=100):
     """
     RGB-D initialisation: one frame is enough.
     Sets frame.pose to identity (world origin) and creates map points directly
-    from depth. Returns (success, new_points).
+    from depth. Returns (success, new_points, reason) -- `reason` is always a
+    string (empty on success) so callers can log *why* init failed without a
+    second code path. This 3-tuple signature is the one run_slam.py expects;
+    a prior version of this function returned a 2-tuple and run_slam.py's
+    3-value unpack crashed on the very first RGB-D frame -- see PROGRESS.md.
     """
-    if frame.n_valid_depths() < min_points:
-        return False, []
+    n_valid = frame.n_valid_depths()
+    if n_valid < min_points:
+        return False, [], f"only {n_valid} valid-depth keypoints (need {min_points})"
 
     frame.set_pose(np.eye(4))
     world_map.add_keyframe(frame)   # assigns frame.kf_seq before points reference it
@@ -49,9 +54,9 @@ def init_rgbd(frame, world_map, min_points=100):
         world_map.erase_keyframe(frame)
         for mp in new_points:
             world_map.erase_map_point(mp)
-        return False, []
+        return False, [], f"only {len(new_points)} points survived unprojection (need {min_points})"
 
-    return True, new_points
+    return True, new_points, ""
 
 
 def init_monocular(frame_a, frame_b, matcher, camera, world_map,
