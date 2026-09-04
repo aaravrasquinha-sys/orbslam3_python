@@ -57,6 +57,17 @@ class MapPoint:
             return
         centers, dists = [], []
         ref_kf, ref_kp_idx, ref_dist = None, None, None
+        # BUGFIX: self.first_keyframe_id is in kf_seq units (assigned from
+        # keyframe.kf_seq at construction -- see local_mapping.py's own
+        # comment on why kf_seq exists), but self.observations is keyed by
+        # frame.id (a different, denser counter -- see frame.py). Comparing
+        # them directly here always failed, so the "reference" keyframe used
+        # for the scale-invariance distance range was effectively whichever
+        # observation dict iteration happened to visit first -- order is
+        # insertion order in Python, which is usually but not necessarily
+        # the earliest observer. Fixed by picking the earliest FRAME.ID
+        # actually present in observations, which is well-defined and cheap.
+        earliest_frame_id = min(self.observations.keys())
         for kf_id, kp_idx in self.observations.items():
             kf = keyframes_by_id.get(kf_id)
             if kf is None or kf.pose is None:
@@ -68,7 +79,7 @@ class MapPoint:
                 continue
             centers.append(d / dist)
             dists.append(dist)
-            if kf_id == self.first_keyframe_id or ref_kf is None:
+            if kf_id == earliest_frame_id or ref_kf is None:
                 ref_kf, ref_kp_idx, ref_dist = kf, kp_idx, dist
 
         if not centers:
@@ -88,8 +99,19 @@ class MapPoint:
         self.observations[frame_id] = keypoint_idx
 
     def erase_observation(self, frame_id):
+        """
+        MapPoint::EraseObservation(). BUGFIX (was `<= 2`): a point with
+        exactly 2 observations is still a perfectly usable, minimally-
+        triangulated landmark -- bundle_adjust.py's own `min_obs_to_optimize`
+        default is 2. Killing it the instant it TOUCHES 2 meant that any
+        keyframe culling (or fusion) event on a 3-observation point
+        immediately deleted it, which is what collapsed the map to
+        zero points with >=4 observations in the Phase-1 ablation (see
+        PROGRESS.md) even on a noise-free synthetic sequence. ORB-SLAM2
+        marks a point bad only when it drops BELOW 2, i.e. <= 1.
+        """
         self.observations.pop(frame_id, None)
-        if len(self.observations) <= 2:
+        if len(self.observations) <= 1:
             self.is_bad = True
 
     def n_observations(self):
