@@ -30,6 +30,11 @@ DEFAULTS = {
         "accel_rate_hz": 250,
         "gyro_rate_hz": 200,
     },
+    "initializer": {
+        "rgbd_min_points": 100,
+        "mono_min_matches": 100,
+        "mono_min_parallax_px": 2.0,
+    },
     "extractor": {
         "nfeatures": 1200,
         "scale_factor": 1.2,
