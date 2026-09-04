@@ -1,0 +1,313 @@
+Field Log — Phase 0/1/2 Hardware Verification
+Fill this in on your terminal, then paste the WHOLE thing back to me,
+including command output verbatim. Don't summarize/prose-ify the outputs —
+that's exactly what caused the back-and-forth with the Gemini report. If a
+field doesn't apply, write "N/A", don't skip it silently.
+0. Environment
+
+bash
+
+python3 -c "import cv2, numpy, gtsam; print('opencv', cv2.__version__); print('numpy', numpy.__version__); print('gtsam OK')"pip show opencv-python opencv-contrib-python 2>&1 | grep -E "^Name|^Version"
+Paste output:
+
+
+[paste here]
+
+gtsam installed successfully?  [ ] Yes  [ ] No — if No, paste the exact pip install gtsam error.
+1. Pre-flight — files landed correctly
+
+bash
+
+grep -c "BUGFIX" initializer.py map_point.py local_mapping.py bundle_adjust_gtsam.py
+Paste output (expect nonzero counts on all 4):
+
+
+[paste here]
+
+2. Synthetic gates (no camera needed)
+
+bash
+
+python3 test_phase1_gate.py 2>&1 | tail -15python3 test_phase2_gate.py 2>&1 | tail -20
+Paste BOTH full tail outputs:
+
+
+[paste here]
+
+If either says anything other than ALL GATES PASSED, stop here and send
+me just this section — don't proceed to hardware tests on top of an
+environment where the baseline itself doesn't reproduce.
+3. Config used for the hardware run
+
+bash
+
+python3 -c "from config import DEFAULT_CONFIG as c; print('backend:', c['bundle_adjust']['backend']); print('keyframe_min_displacement:', c['tracking']['keyframe_min_displacement'])"
+(adjust the import if your config variable name differs)
+Paste output:
+
+
+[paste here]
+
+Which backend did you actually run with?  [ ] scipy  [ ] gtsam
+4. Stationary test (camera still, ~10s, no motion)
+Command run:
+
+
+[paste your exact command, e.g. python3 run_slam.py --realsense --seconds 10]
+
+Final summary block from the run (frames processed, tracking
+successes/losses, keyframes, path length, net displacement — whatever
+your run prints at the end):
+
+
+[paste here]
+
+map_health() output — add this right after the run finishes, before
+the process exits:
+
+python
+
+import metricsprint(metrics.map_health(slam))
+
+[paste the dict here]
+
+5. Short straight-line motion test (~1m, no rotation)
+Command run:
+
+
+[paste here]
+
+Final summary + map_health() dict:
+
+
+[paste here]
+
+Last 15 [TRACK] lines before the run ended (or before any tracking
+loss, if one occurred):
+
+
+[paste here]
+
+6. The original 30cm-forward/turn/30cm-back loop test
+This is the one that originally produced 4–21 Atlas maps and zero loop
+closures — the direct comparison point.
+Command run:
+
+
+[paste here]
+
+Final summary block:
+
+
+[paste here]
+
+map_health() dict — this is the single most important field in this
+whole document:
+
+
+[paste here]
+
+If more than 1 Atlas map was created, the last 15 [TRACK] lines
+immediately before EACH map-split event (copy this block once per
+split):
+
+
+--- split event 1 ---
+[paste here]
+
+--- split event 2 (if any) ---
+[paste here]
+[BA] log line samples — 3-4 representative lines from throughout the
+run, so I can see the free/fixed/points/obs numbers and which backend
+actually fired:
+
+
+[paste here]
+
+7. Self-check before sending (tick what applies)
+Cross-reference against RUNBOOK.md §4 before flagging something as a
+new bug — saves a round-trip if it's actually an already-documented,
+expected limitation:
+
+ Loop closures = 0 — expected until Phase 5, not a bug on its own (RUNBOOK §4.1)
+ IMU never initializes — expected until Phase 7, not a bug on its own (RUNBOOK §4.2)
+ More than 1 Atlas map — check whether the pre-split [TRACK] lines show gradual or sudden inlier collapse (RUNBOOK §4.3, §4.7) before flagging
+ Low max_observations — check your keyframe_min_displacement against walking speed first (RUNBOOK §4.4)
+ [BA] lines show backend=scipy even though config says gtsam — means the fallback fired; paste the [BA] config requested gtsam... warning line if present
+8. Anything else you noticed
+Free text — crashes, weird behavior, anything that doesn't fit a field
+above:
+
+Phase 2 Runbook — GTSAM Bundle Adjustment
+Companion to RUNBOOK.md (Phase 0/1). Read that one first if you haven't
+— this one assumes the Phase 1 culling fix is already in place and adds
+what's specific to the GTSAM backend swap.
+1. What changed, in one paragraph
+bundle_adjust.py's scipy-based local BA is now optionally replaced bybundle_adjust_gtsam.py, selected via config["bundle_adjust"]["backend"] = "gtsam". Three real bugs were found and fixed while verifying it, all
+via the same "run it against synthetic ground truth, don't trust that low
+cost means correct" discipline as Phase 1: a variable-consistency crash
+(factor referencing a keyframe never inserted into the graph), a silent
+wrong-answer bug (plain 2D reprojection factors threw away RGB-D's actual
+depth measurement, reintroducing monocular scale ambiguity), and a second,
+different-root-cause crash with the identical error message (an isolated
+graph node from a freshly-created keyframe with no mature points yet).
+2. Architecture map
+┌─────────────────────────────────────────────────────────────┐
+│  UNCHANGED FROM PHASE 1                                       │
+│    Everything in RUNBOOK.md's architecture map still applies. │
+├─────────────────────────────────────────────────────────────┤
+│  NEW THIS PHASE                                                │
+│    bundle_adjust_gtsam.py  — GTSAM local BA, virtual-stereo   │
+│                              depth factors, config-selectable  │
+│    config["bundle_adjust"]["backend"]  — "scipy" | "gtsam"    │
+│    run_slam.py                        — backend switch + a    │
+│                              safety fallback if gtsam missing  │
+├─────────────────────────────────────────────────────────────┤
+│  STILL NOT DONE — same gaps as before, unaffected by Phase 2  │
+│    pose_graph.py → GTSAM        (Phase 6, needs loop closing) │
+│    IMU factors → GTSAM          (Phase 7, needs IMU wiring)   │
+│    Loop closing, real BoW, extractor rework, dense fallback   │
+│    — see RUNBOOK.md, none of this changed                     │
+└─────────────────────────────────────────────────────────────┘
+3. Pre-flight checklist, Phase-2-specific
+3.1 — Confirm gtsam actually installed, not just attempted.
+
+python3 -c "import gtsam; print(gtsam.__file__)"
+gtsam's Python bindings are a compiled wheel with real binary
+dependencies (Eigen, Boost in some builds). A pip install gtsam that
+appears to succeed but was actually served from a cache or partial
+download can produce confusing ImportErrors only when a specific
+submodule is touched (e.g. gtsam.noiseModel.mEstimator), not at the top-
+level import gtsam. Test the actual symbols this code uses:
+
+python3 -c "
+import gtsam
+from gtsam import Cal3_S2Stereo, StereoPoint2, GenericStereoFactor3D, GenericProjectionFactorCal3_S2
+from gtsam.symbol_shorthand import X, L
+print('all required symbols present')
+"
+3.2 — Confirm the fallback path works, deliberately.
+Before trusting the "gtsam" backend, deliberately break it to confirmrun_slam.py degrades safely instead of silently doing nothing:
+
+python3 -c "
+import sys
+sys.modules['bundle_adjust_gtsam'] = None  # simulate gtsam not installed
+" 
+Actually easier: just check the fallback log line appears when you setbackend: "gtsam" in an environment without gtsam installed — you should
+see [BA] config requested gtsam backend but gtsam is not installed -- falling back to scipy, NOT silence. If you see silence and BA simply
+never runs, something regressed — that would be worse than either backend
+alone, since it means keyframes accumulate with zero optimization.
+3.3 — Run both gates together before hardware, not just Phase 2's.
+
+python3 test_phase1_gate.py && python3 test_phase2_gate.py
+Both must pass. Phase 2 was verified not to regress Phase 1 in my
+environment; confirm the same holds in yours before layering a hardware
+test on top of both.
+4. Symptom → diagnosis → fix (GTSAM-specific)
+4.1 — ImportError or ModuleNotFoundError: No module named 'gtsam'
+Not a code bug. Either pip install gtsam wasn't run, or it silently
+failed (check pip list | grep -i gtsam). If you don't want to debug a
+gtsam install right now, set backend: "scipy" in config and proceed —
+Phase 1's fixes are backend-independent, you don't need GTSAM working to
+test Phase 1's map-lifecycle fix on hardware.
+
+4.2 — RuntimeError: An inference algorithm was called with inconsistent arguments
+This exact message covers two different root causes in this codebase
+(see bundle_adjust_gtsam.py's docstring, Bugs 1 and 3) — both were found
+and fixed, but if you see this message again on real hardware data, it
+means a THIRD variant of the same class of bug exists that the synthetic
+tests didn't reproduce. Useful things to capture before reporting:
+
+# right before the crash, dump exactly what's inconsistent:
+print("free kfs:", [kf.id for kf in free_kfs])
+print("fixed kfs:", [kf.id for kf in fixed_kfs])
+print("points:", len(points), "total observations touched:", n_obs)
+Real sensor data has messier edge cases than synthetic sequences —
+duplicate keyframe insertion during a race between tracking and local
+mapping, a map point erased mid-BA-call, etc. If this fires, it's a real
+finding, not noise — send me the three print lines above plus the
+surrounding [TRACK]/[RGBD] log context.
+
+4.3 — [BA-GTSAM] cost goes to ~0 but the trajectory looks visibly wrong
+This is exactly Bug 2 from Phase 2's own verification — the gauge/scale
+ambiguity signature. It should be structurally prevented now (every BA
+call either has a real fixed anchor or the explicit fallback prior), but
+if you see a suspiciously perfect cost alongside an implausible trajectory
+jump, check:
+
+[BA-GTSAM] N free + M fixed kfs, ...
+If M fixed kfs = 0 on a call where the map clearly has more keyframes
+than the window, that's the bug resurfacing — the fixed-keyframe detection
+logic didn't find an anchor when one should exist. Report the map size at
+that point (n_keyframes_alive from metrics.map_health()) alongside the
+window setting.
+
+4.4 — GTSAM backend is noticeably slower than scipy, not faster
+Expected in small-map regimes, not a regression. Phase 2's own
+measurement: on a healthy, properly-culled 60-frame map (Phase 1 working
+as intended), a single GTSAM BA call took ~75-80ms, comparable to scipy's
+baseline — GTSAM's real advantage (marginalizing landmarks so cost scales
+with pose count, not pose+landmark count) shows up as the number of FIXED
+keyframes grows, which is exactly the scenario Phase 1's culling fix is
+designed to prevent from happening uncontrolled. In other words: if
+Phase 1 is working, you may not see a dramatic GTSAM speed advantage on
+short test clips, and that's consistent with everything measured so far,
+not a sign something's wrong. The comparison that WOULD show a difference
+needs a much longer, more keyframe-dense recording than a 10-30s D435i
+clip — not worth engineering a hardware test around Phase 2 alone.
+
+4.5 — Poses "jump" specifically at the moment BA switches between scipy and gtsam mid-run
+Should not happen — the backend is selected once at SLAMSystem
+construction from config, not per-call. If you see this, check you're not
+accidentally constructing two different SLAMSystem instances (e.g., one
+for a warm-up pass, one for the real run) with different configs loaded.
+
+4.6 — Points visibly drift or the map looks warped after a GTSAM BA call, but no crash and no gates fail
+The synthetic gates test bounded, well-behaved input. Real sensor depth
+noise is heavier-tailed (holes, flying pixels at depth discontinuities,
+occasional gross outliers near object edges). The Huber robust kernel
+(huber_f_scale in config) is meant to down-weight these, but if a
+specific keyframe has an unusually high fraction of bad depth (e.g.
+pointed at a reflective/transparent surface), even Huber can't fully
+compensate. This is a real, expected RGB-D limitation, not a GTSAM
+integration bug — but if it's happening frequently, it's worth logging
+which observations are stereo-factor vs mono-fallback (n_obs_stereo vsn_obs - n_obs_stereo in the [BA-GTSAM] line) since a high mono-
+fallback fraction means a lot of points are being optimized WITHOUT the
+depth constraint that fixes Bug 2 — i.e., check whether your D435i's
+depth-valid fraction on the affected keyframes is unusually low.
+5. Testing order
+Same order as RUNBOOK.md §5 (stationary → straight-line → loop test →
+facility walkthrough), run TWICE at each step: once with backend: "scipy", once with backend: "gtsam". You're not looking for GTSAM to
+be dramatically better on a short clip (see §4.4) — you're looking for it
+to be at least as good and not crash, which is the actual claim this
+phase makes. A real, measurable GTSAM advantage will show up once Phase 6
+(pose-graph/loop-closure optimization) and longer recordings are in play.
+
+6. What "success" looks like for this phase
+Both backends produce map-health numbers in the same order of
+magnitude on the same recording (neither one should look broken
+relative to the other).
+No inconsistent arguments crashes on real hardware data.
+[BA-GTSAM] lines show a real fixed-keyframe count once the map
+exceeds the window size (confirms the anchor logic is working on real,
+not just synthetic, data).
+Fill out FIELD_LOG.md with both backends and send it back — that's
+the actual gate for moving to Phase 3.      # Phase 0 + Phase 1 — completed and verified
+
+## Note on hardware verification status (added after real-D435i test)
+
+A real-hardware test was reported (Atlas fragmentation 21→2 maps, non-zero
+point fusion, displacement matching physical motion) but the report did
+not include the map-health obs-count histogram that this phase's gates
+are actually built around — see §"Verification" below for why that
+specific number matters more than created/culled/fused counts alone. The
+positive signals reported (map count, fusion, displacement) are real and
+consistent with the fix working; Phase 2 proceeded on that basis rather
+than blocking on it, since Phase 2 (the optimizer swap) doesn't depend on
+Phase 1's exact real-hardware numbers. This is flagged as **provisional**,
+not closed, until the histogram is checked. Two-line check, run whenever
+a terminal is available, right after your real test:
+
+```python
+import metrics
+print(metrics.map_health(slam))   # `slam` = your SLAMSystem instance
