@@ -51,21 +51,30 @@ class SLAMSystem:
         self.use_imu = use_imu
         self.cfg = load_config(config_path)
 
-        self.extractor = Extractor(nfeatures=1200, scale_factor=1.2, nlevels=8,
-                                   ini_th_fast=20, min_th_fast=7)
+        # BUGFIX: config.py was loaded (self.cfg) but every module below
+        # used to be constructed with hardcoded defaults instead of cfg's
+        # values -- e.g. cfg["loop_closing"]["vocab_words"]=10000 existed on
+        # disk but Vocabulary(n_words=64) below ignored it completely, and
+        # nothing in cfg["extractor"]/["tracking"]/["local_mapping"] had any
+        # effect at all. Wired through properly now so config.yaml edits
+        # actually change behavior. See PROGRESS.md.
+        self.extractor = Extractor(**self.cfg["extractor"])
         self.matcher = Matcher()
         self.atlas = Atlas()
         self.tracking = Tracking(camera, self.extractor, self.matcher,
-                                 self.atlas.active_map)
+                                 self.atlas.active_map, **self.cfg["tracking"])
         self.local_mapping = LocalMapping(camera, self.matcher,
                                           self.atlas.active_map,
-                                          extractor=self.extractor)
+                                          extractor=self.extractor,
+                                          **self.cfg["local_mapping"])
         # Shared covisibility graph: LocalMapping rebuilds this dict IN
         # PLACE (see covisibility.py) after every keyframe, so Tracking
         # always sees the latest version through this one reference.
         self.tracking.covis_graph = self.local_mapping.covis_graph
-        self.vocab = Vocabulary(n_words=64)
-        self.loop_closer = LoopClosing(camera, self.matcher, self.vocab)
+        self.vocab = Vocabulary(n_words=self.cfg["loop_closing"]["vocab_words"])
+        self.loop_closer = LoopClosing(camera, self.matcher, self.vocab,
+                                       min_keyframe_gap=self.cfg["loop_closing"]["min_keyframe_gap"],
+                                       consistency_checks=self.cfg["loop_closing"]["consistency_checks"])
 
         # ── Visual-inertial state (Phase 3/4) ───────────────────────────
         # imu_preint: the RUNNING preintegration accumulator since the last
@@ -99,7 +108,12 @@ class SLAMSystem:
                       depth_image=depth_image)
         
         # ── Diagnostic output immediately after creating each Frame ──
-        print(f"[RGBD] Frame {frame.id}: keypoints={len(frame.keypoints)}, valid_depth={getattr(frame, 'valid_depth_count', 0)}")
+        # BUGFIX: Frame has no `valid_depth_count` attribute -- this used to
+        # silently print 0 forever via getattr's fallback. n_valid_depths()
+        # is the real accessor (see frame.py).
+        if self.verbose:
+            print(f"[RGBD] Frame {frame.id}: keypoints={len(frame.keypoints)}, "
+                  f"valid_depth={frame.n_valid_depths()}")
 
         self.frames.append(frame)
         world_map = self.atlas.active_map
@@ -110,7 +124,8 @@ class SLAMSystem:
         # ── initialisation ───────────────────────────────────────────────
         if self.tracking.state == "NOT_INITIALIZED":
             if self.use_depth:
-                ok, new_pts, fail_reason = initializer.init_rgbd(frame, world_map)
+                ok, new_pts, fail_reason = initializer.init_rgbd(
+                    frame, world_map, min_points=self.cfg["initializer"]["rgbd_min_points"])
                 if ok:
                     self.tracking.state = "OK"
                     self.tracking.last_frame = frame
@@ -243,7 +258,11 @@ class SLAMSystem:
                         bias_gyro=self.bias_gyro, bias_accel=self.bias_accel,
                         window=self.cfg["imu"]["ba_window"], verbose=self.verbose)
             elif n_kf >= 3:
-                local_bundle_adjust(world_map, self.camera, window=8,
+                local_bundle_adjust(world_map, self.camera,
+                                    window=self.cfg["bundle_adjust"]["window"],
+                                    max_iter=self.cfg["bundle_adjust"]["max_iter"],
+                                    min_obs_to_optimize=self.cfg["bundle_adjust"]["min_obs_to_optimize"],
+                                    huber_f_scale=self.cfg["bundle_adjust"]["huber_f_scale"],
                                     verbose=self.verbose)
 
             # ── loop closing ─────────────────────────────────────────────
