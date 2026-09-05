@@ -1,37 +1,3 @@
-"""
-synthetic.py — deterministic synthetic RGB-D sequences for regression testing.
-
-WHY THIS EXISTS: every bug found during the Phase-0/1 forensic audit (the
-initializer crash, the erase_observation threshold, the cull_keyframes
-over-culling) was found by running a synthetic sequence and measuring map
-statistics, NOT by running on real RealSense hardware. A synthetic sequence
-is deterministic (same seed -> bit-identical run), needs no camera, runs in
-seconds, and lets you isolate ONE variable (motion, texture, rotation rate)
-at a time -- which is impossible with a physical camera and a 30cm cable.
-
-This is meant to be a permanent fixture of the test suite, not a one-off
-script: every future change to tracking.py / local_mapping.py /
-bundle_adjust.py should be checked against scroll_sequence() (or a purpose-
-built variant) before being trusted on real hardware.
-
-Two sequence types:
-  scroll_sequence()   — camera translates in front of a fixed random-texture
-                        plane at constant depth. No rotation, no noise, no
-                        depth holes. This is the "does the map lifecycle
-                        even work in the easiest possible case" test -- if a
-                        change makes scroll_sequence() worse, it is not the
-                        camera's fault.
-  yaw_sequence()      — adds a homography-warped rotation component, so the
-                        frame-to-frame appearance genuinely changes (not
-                        just translates), exercising the same failure mode
-                        that collapsed real tracking at frame ~145 in the
-                        original D435i logs.
-
-Both return (images, depths, gt_poses) with gt_poses as 4x4 camera-to-world
-matrices, so metrics.py can compute ATE/RPE directly against a real ground
-truth instead of only inspecting internal map statistics.
-"""
-
 import numpy as np
 import cv2
 
@@ -59,11 +25,12 @@ def low_texture_patch(height=480, width=640, rng=None):
 
 
 def scroll_sequence(n_frames=120, height=480, width=640, depth_m=2.0,
-                    px_per_frame=8, seed=1, fx=385.0, fy=385.0):
+                    px_per_frame=8, seed=1, noise_std=15.0,
+                    fx=379.81365966796875, fy=379.81365966796875,
+                    cx=322.3706970214844, cy=238.14862060546875):
     """
     Pure lateral translation in front of a fronto-parallel textured plane at
-    constant depth. Ground truth is exact: camera moves +x at a constant
-    rate, everything else fixed.
+    constant depth, with empirical depth jitter applied.
 
     Returns (images, depths, gt_poses, camera_dict).
     """
@@ -75,51 +42,71 @@ def scroll_sequence(n_frames=120, height=480, width=640, depth_m=2.0,
     # numerically consistent with the camera model instead of an arbitrary
     # unit, so ATE against gt_poses means something.
     m_per_px = depth_m / fx
+    base_depth_mm = depth_m * 1000.0
 
     for i in range(n_frames):
         images.append(tex[:, i * px_per_frame: i * px_per_frame + width].copy())
-        depths.append(np.full((height, width), int(depth_m * 1000), np.uint16))
+        
+        # Inject empirical depth jitter matching the physical D435i
+        if noise_std > 0:
+            noisy_depth = rng.normal(base_depth_mm, noise_std, (height, width))
+            noisy_depth = np.clip(noisy_depth, 0, 65535).astype(np.uint16)
+        else:
+            noisy_depth = np.full((height, width), int(base_depth_mm), np.uint16)
+            
+        depths.append(noisy_depth)
+        
         pose = np.eye(4)
         pose[0, 3] = i * px_per_frame * m_per_px
         pose[2, 3] = 0.0
         gt_poses.append(pose)
 
-    cam = dict(fx=fx, fy=fy, cx=width / 2, cy=height / 2,
-              width=width, height=height, depth_scale=0.001)
+    cam = dict(fx=fx, fy=fy, cx=cx, cy=cy,
+               width=width, height=height, depth_scale=0.001)
     return images, depths, gt_poses, cam
 
 
 def yaw_sequence(n_frames=120, height=480, width=640, depth_m=2.0,
-                 max_yaw_deg=25.0, seed=1, fx=385.0, fy=385.0):
+                 max_yaw_deg=25.0, seed=1, noise_std=15.0,
+                 fx=379.81365966796875, fy=379.81365966796875,
+                 cx=322.3706970214844, cy=238.14862060546875):
     """
     Camera yaws back and forth (sinusoidal) in front of a large textured
     plane, simulating the "turn to look down a corridor" motion that
     collapsed tracking at frame ~145 in the original D435i logs. Depth
-    stays constant (fronto-parallel plane) so the RGB-D initializer and
-    unprojection stay exact -- this isolates ROTATION-under-matching from
-    depth-quality issues, which is a separate failure mode (test with
-    low_texture_patch() instead).
+    stays constant (fronto-parallel plane) with empirical depth jitter applied.
     """
     rng = np.random.RandomState(seed)
     base = _make_texture(rng, height, width * 3)
     base = base[:, width:2 * width]   # center crop, reused via homography
 
-    K = np.array([[fx, 0, width / 2], [0, fy, height / 2], [0, 0, 1]])
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
     images, depths, gt_poses = [], [], []
+    base_depth_mm = depth_m * 1000.0
+
     for i in range(n_frames):
         yaw = np.deg2rad(max_yaw_deg * np.sin(2 * np.pi * i / n_frames))
         R = np.array([[np.cos(yaw), 0, np.sin(yaw)],
-                     [0, 1, 0],
-                     [-np.sin(yaw), 0, np.cos(yaw)]])
+                      [0, 1, 0],
+                      [-np.sin(yaw), 0, np.cos(yaw)]])
         H = K @ R @ np.linalg.inv(K)
         H /= H[2, 2]
         img = cv2.warpPerspective(base, H, (width, height))
         images.append(img)
-        depths.append(np.full((height, width), int(depth_m * 1000), np.uint16))
+        
+        # Inject empirical depth jitter matching the physical D435i
+        if noise_std > 0:
+            noisy_depth = rng.normal(base_depth_mm, noise_std, (height, width))
+            noisy_depth = np.clip(noisy_depth, 0, 65535).astype(np.uint16)
+        else:
+            noisy_depth = np.full((height, width), int(base_depth_mm), np.uint16)
+            
+        depths.append(noisy_depth)
+        
         pose = np.eye(4)
         pose[:3, :3] = R
         gt_poses.append(pose)
 
-    cam = dict(fx=fx, fy=fy, cx=width / 2, cy=height / 2,
-              width=width, height=height, depth_scale=0.001)
+    cam = dict(fx=fx, fy=fy, cx=cx, cy=cy,
+               width=width, height=height, depth_scale=0.001)
     return images, depths, gt_poses, cam
