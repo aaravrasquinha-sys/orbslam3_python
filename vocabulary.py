@@ -21,6 +21,28 @@ except ImportError:
 
 class Vocabulary:
     def __init__(self, n_words=64, random_state=0):
+        # SAFETY CLAMP (found during Phase 3 verification): n_words=10000
+        # was already sitting in config.py from the original repo, but was
+        # silently INERT before Phase 0's config-wiring fix (Vocabulary
+        # was hardcoded to n_words=64 regardless of what config said). This
+        # is the first time it's ever actually been read -- and 10,000
+        # clusters via online sklearn KMeans is fundamentally incompatible
+        # with any usable sample cap (n_samples must exceed n_clusters, and
+        # KMeans cost scales with samples x clusters x dims per iteration
+        # regardless of tuning). Real DBoW2-style vocabularies use 10,000+
+        # words too -- but from a PRE-TRAINED tree loaded from disk, never
+        # clustered at runtime. That's Phase 5 (see module docstring). For
+        # this placeholder, clamp to a value verified fast in practice and
+        # warn once, rather than let a legitimate future config value
+        # silently hang the pipeline against today's implementation.
+        self._requested_n_words = n_words
+        if n_words > 256:
+            print(f"[vocabulary] WARNING: n_words={n_words} requested, but this "
+                 f"is the KMeans PLACEHOLDER (see module docstring) -- clamping "
+                 f"to 256 for this build. The real Phase 5 ORBvoc loader will "
+                 f"support the full {n_words}-word vocabulary from a pre-trained "
+                 f"file with no runtime clustering cost.")
+            n_words = 256
         self.n_words = n_words
         self.random_state = random_state
         self.kmeans = None
@@ -29,23 +51,39 @@ class Vocabulary:
     def is_ready(self):
         return self.kmeans is not None
 
-    def build(self, all_descriptors, max_samples=20000):
+    def build(self, all_descriptors, max_samples=2000):
         """
         Cluster pooled descriptors into n_words 'visual words'.
         all_descriptors: (M,32) uint8
+
+        STOPGAP FIX (found during Phase 3 verification, not a Phase 3
+        change itself): with the OLD max_samples=20000 and n_init=4,
+        sklearn's KMeans on this much data took 133 SECONDS in a single
+        call, hanging the whole pipeline -- discovered because Phase 3's
+        extractor rewrite gives every keyframe a much richer, better-
+        distributed descriptor pool than the old bare-ORB version did, so
+        this pre-existing placeholder (see the module docstring's own
+        "biggest simplification in the project" admission) received
+        enough real data to go from "slow but tolerable" to catastrophic.
+        This is NOT fixed here -- it's tightened enough to stop hanging
+        the pipeline while remaining exactly the placeholder it always
+        was. The real fix is Phase 5's planned ORBvoc-format loader
+        (a pre-trained vocabulary tree, no KMeans at all at runtime).
+        Do not raise max_samples back up without re-profiling.
         """
         if not _HAVE_SKLEARN:
             raise ImportError("scikit-learn required: pip install scikit-learn")
         if all_descriptors is None or len(all_descriptors) < self.n_words:
             return False
 
+        max_samples = max(max_samples, self.n_words * 4)
         data = np.asarray(all_descriptors, dtype=np.float32)
         if len(data) > max_samples:
             idx = np.random.RandomState(self.random_state).choice(
                 len(data), max_samples, replace=False)
             data = data[idx]
 
-        self.kmeans = KMeans(n_clusters=self.n_words, n_init=4,
+        self.kmeans = KMeans(n_clusters=self.n_words, n_init=1,
                              random_state=self.random_state)
         self.kmeans.fit(data)
         self._cache.clear()
