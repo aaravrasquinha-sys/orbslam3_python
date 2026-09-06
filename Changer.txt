@@ -377,3 +377,470 @@ runbook's own texture-related notes above).
 4. Map-health numbers (obs≥4, max observations) on real hardware are the
   same order of magnitude as the synthetic gate's — not necessarily
   identical, real data is messier, but not wildly different either.
+
+
+
+
+Phase 4 — Dense RGB-D Fallback
+New files (2):
+
+dense_odometry.py
+test_phase4_gate.py
+Changed files (4):
+
+frame.py — added keep_dense flag to retain full grayscale image + depth-in-meters
+tracking.py — added _track_dense() (Strategy 3), new constructor params (use_dense_fallback, dense_depth_trunc)
+run_slam.py — keep_dense=True at Frame construction, deferred-cleanup logic for non-keyframe dense data (_pending_dense_cleanup)
+config.py — added use_dense_fallback, dense_depth_trunc to the tracking section
+Also touched (bug fixes found during this phase's own verification, not core scope): synthetic.py (new textureless_segment_sequence() generator, rebuilt twice for physical plausibility)
+
+
+Phase 5 — Real BoW + Relocalization
+
+New files (5):
+
+orb_vocabulary.py
+setup_vocabulary.py
+keyframe_database.py
+relocalization.py
+test_phase5_gate.py
+
+Changed files (6):
+
+run_slam.py — real vocabulary loading, keyframe_db wiring, relocalization call in the LOST-handling block, removed obsolete vocab.build()
+loop_closing.py — adapted to new vocab API (transform/score instead of histogram/similarity), fixed the frame.id/kf_seq unit-mismatch bug
+atlas.py — added switch_active_map(), map_containing_keyframe()
+local_mapping.py — cull_keyframes() now returns culled IDs too (for keyframe-database cleanup)
+dense_odometry.py — added photometric residual quality check (fixed the "succeeds on pure noise" masking bug)
+tracking.py — _track_dense() reference changed from last_keyframe to last_frame
+
+Deprecated (not deleted): vocabulary.py — the old KMeans placeholder, nothing imports it anymore
+
+"""
+orb_vocabulary.py — Phase 5: real ORBvoc-format vocabulary, replacing
+vocabulary.py's KMeans placeholder entirely.
+
+WHY THIS REPLACES vocabulary.py: the KMeans version was explicitly
+documented as "the biggest simplification in the project" from Phase 0
+onward, and Phase 3's own verification found it could hang for 133
+seconds in a single call once fed realistic data (see PROGRESS.md). More
+fundamentally, an online-clustered ~256-word vocabulary has nowhere near
+the discriminative power of a real vocabulary tree, which is why loop
+detection's practical reliability was always going to be poor even after
+the Phase 3 stopgap. This is the real fix, not another patch.
+
+WHAT THIS IS: a pure Python/numpy loader and classifier for DBoW2's
+actual text vocabulary format (k=10, L=6 hierarchical tree, 1,082,072
+nodes, ~1,000,000 of them leaf "words" with real IDF weights) --
+specifically ORB-SLAM3's own shipped ORBvoc.txt, the same file real
+ORB-SLAM3 uses. See setup_vocabulary.py for how to fetch and cache it;
+this module raises a clear error (not a silent fallback) if the cache
+is missing, since a facility-mapping run without a real vocabulary
+should be a deliberate choice, not something that happens by accident.
+
+WHY PURE PYTHON/NUMPY, NOT A C++ WRAPPER (pyDBoW3 etc.): classifying one
+descriptor is L*k = 6*10 = 60 Hamming-distance comparisons between 32-byte
+codes -- trivial compute, no real-time requirement in this project. Build
+requirements for pyDBoW3-style bindings would need compiling against this
+project's exact OpenCV build (5.0.0.93 as of the original environment
+audit), which is newer than what such bindings are typically maintained
+against -- a real, avoidable source of build breakage for negligible
+performance gain. Measured in this file's own verification: classifying
+a full frame's ~1000 descriptors takes well under 100ms (see
+PROGRESS.md), consistent with this project's per-frame extraction cost
+already being 150-250ms -- BoW classification is not the bottleneck.
+
+FORMAT (reverse-engineered and verified against the actual file, not
+assumed from documentation -- see PROGRESS.md's Phase 5 section for the
+verification methodology, including one mistake caught and fixed):
+  Header line: "k L scoring_type weighting_type" (k=10, L=6 for the
+  standard ORB-SLAM3 vocabulary: a 10-ary tree, 6 levels deep).
+  Each following line: "parent_id is_leaf_flag desc[0..31] weight"
+    parent_id: 0 = virtual root; otherwise 1-indexed node id (this row's
+               own node id is its line number, 1-indexed).
+    is_leaf_flag: 0 for inner nodes, 1 for leaf/word nodes -- NOT a
+               unique word identifier (see below).
+    desc:      32 bytes (0-255), the node's representative ORB descriptor.
+    weight:    IDF weight, meaningful only for leaf/word nodes (0 for
+               inner nodes, and also legitimately 0 for very common words).
+  MISTAKE CAUGHT DURING VERIFICATION: the second column was initially
+  assumed to be a sequential, unique word id (its nonzero-count, 971,814,
+  is close to the expected leaf count for this tree, which is what made
+  the wrong assumption plausible at first glance). This module's own
+  correctness test caught it -- n_words computed as 1 (from taking
+  max() of what is actually a 0/1 flag), and every distinct random
+  descriptor set scoring identical to every other (since every
+  descriptor was being assigned the same "word"). Fixed by using each
+  leaf's own node id (row index + 1, already unique by construction) as
+  the actual word identifier instead of this column's value.
+
+TREE STRUCTURE, verified empirically before this module was written:
+children of a given parent are ALWAYS a contiguous run of rows (checked
+across all 1,082,072 rows, zero violations), which is what allows the
+array-based child_start/child_count lookup below instead of a slower
+reverse-index structure. Greedy nearest-Hamming-distance descent at each
+level does NOT always reproduce a leaf's own true ancestor chain exactly
+(measured: ~75% exact self-classification on a random sample) -- this
+was checked and confirmed to be EXPECTED, not a bug: every mismatch
+happens at high Hamming distance (>50 of 256 bits) with several genuine
+near-ties, because an ancestor several levels up represents a broad
+average over enormous numbers of training descriptors, not a tight match
+to any specific descendant. This is inherent to coarse-to-fine
+hierarchical search generally (including real DBoW2's own behavior, same
+algorithm), not a defect in this implementation.
+"""
+
+import os
+import numpy as np
+
+_DEFAULT_CACHE_PATH = os.path.join(os.path.dirname(__file__), "orbvoc_cache.npz")
+
+
+def _hamming_batch(query, candidates):
+    """query: (32,) uint8. candidates: (N,32) uint8. Returns (N,) int distances."""
+    return np.unpackbits(np.bitwise_xor(query, candidates), axis=-1).sum(axis=-1)
+
+
+class ORBVocabulary:
+    def __init__(self, cache_path=None, levelsup=4):
+        """
+        levelsup: DBoW2's standard "feature vector" depth parameter --
+        SearchByBoW restricts candidate matches to pairs sharing the same
+        node at depth (L - levelsup), a coarser grouping than the full
+        leaf level. levelsup=4 is DBoW2's own conventional default.
+        """
+        self.cache_path = cache_path or _DEFAULT_CACHE_PATH
+        self.levelsup = levelsup
+        self.k = None
+        self.L = None
+        self.n_words = 0
+        self._loaded = False
+
+    def is_ready(self):
+        return self._loaded
+
+    def load(self):
+        if not os.path.exists(self.cache_path):
+            raise FileNotFoundError(
+                f"Vocabulary cache not found at {self.cache_path}. "
+                f"Run `python3 setup_vocabulary.py` once to fetch and cache "
+                f"the real ORB-SLAM3 vocabulary (~42MB download, ~90s total, "
+                f"one-time). This is a deliberate hard requirement, not a "
+                f"silent fallback -- a facility-mapping run without a real "
+                f"vocabulary should be a conscious choice.")
+        d = np.load(self.cache_path)
+        self.k = int(d["k"])
+        self.L = int(d["L"])
+        self.parent = d["parent"]
+        self.word_id = d["word_id"]
+        self.descs = d["descs"]
+        self.weight = d["weight"]
+        self.child_start = d["child_start"]
+        self.child_count = d["child_count"]
+        self.n_words = int(np.count_nonzero(self.word_id))
+        # feature-vector level: how many hops from root
+        self.fv_level = max(0, self.L - self.levelsup)
+        self._loaded = True
+        return self
+
+    def _classify_one(self, descriptor):
+        """
+        Descend the tree greedily by Hamming distance. Returns
+        (word_id, weight, fv_node_id) -- fv_node_id is the node visited
+        at depth self.fv_level, used for the feature vector (SearchByBoW).
+
+        BUGFIX (found via this module's OWN test giving nonsensical output
+        -- n_words=1 and every random descriptor set scoring identical to
+        every other): the file's second column was assumed to be a
+        sequential, unique word identifier. It is not -- verified
+        directly: `word_id.max() == 1` while `count_nonzero(word_id) ==
+        971814`. It is a binary IS-LEAF flag (0/1), not an id. The actual
+        unique identifier for a leaf/word is its own node id (= row index
+        + 1, unique by construction, already used as `node_id` internally
+        throughout this class) -- using that instead of the flag value.
+        """
+        node_id = 0
+        fv_node_id = 0
+        for level in range(self.L):
+            cs, cc = self.child_start[node_id], self.child_count[node_id]
+            if cc == 0:
+                break
+            cand_rows = np.arange(cs, cs + cc)
+            dists = _hamming_batch(descriptor, self.descs[cand_rows])
+            node_id = int(cand_rows[np.argmin(dists)]) + 1
+            if level + 1 == self.fv_level:
+                fv_node_id = node_id
+        row = node_id - 1
+        is_leaf = self.word_id[row] != 0
+        word_id = node_id if is_leaf else 0   # BUGFIX: was self.word_id[row] (the 0/1 flag)
+        return int(word_id), float(self.weight[row]), fv_node_id
+
+    def transform(self, descriptors):
+        """
+        descriptors: (M,32) uint8.
+        Returns (bow_vector, feature_vector):
+          bow_vector: dict {word_id: tf_idf_weight}, L1-normalized (sums
+                     to 1.0 across all entries) -- DBoW2's standard
+                     representation, used for place-similarity scoring.
+          feature_vector: dict {fv_node_id: [descriptor indices]} --
+                          descriptors sharing a coarse-level node,
+                          used to restrict SearchByBoW's candidate set
+                          instead of brute-forcing every descriptor pair.
+        """
+        if descriptors is None or len(descriptors) == 0:
+            return {}, {}
+
+        bow_raw = {}
+        feature_vector = {}
+        for i, desc in enumerate(descriptors):
+            word_id, w, fv_node = self._classify_one(desc)
+            if word_id == 0 or w <= 0:
+                continue   # inner-node fallback (shouldn't happen) or zero-IDF word
+            bow_raw[word_id] = bow_raw.get(word_id, 0.0) + w
+            feature_vector.setdefault(fv_node, []).append(i)
+
+        total = sum(bow_raw.values())
+        if total > 1e-12:
+            bow_vector = {w: v / total for w, v in bow_raw.items()}
+        else:
+            bow_vector = {}
+        return bow_vector, feature_vector
+
+    @staticmethod
+    def score(bow_a, bow_b):
+        """
+        DBoW2's L1-norm score: 1 - 0.5 * sum(|a_i - b_i|) over the union
+        of nonzero words, bounded to [0, 1] (1.0 = identical distribution).
+        Sparse-dict implementation -- only touches words present in
+        EITHER vector, not all ~1,000,000 possible words.
+        """
+        if not bow_a or not bow_b:
+            return 0.0
+        keys = set(bow_a.keys()) | set(bow_b.keys())
+        l1 = sum(abs(bow_a.get(k, 0.0) - bow_b.get(k, 0.0)) for k in keys)
+        return max(0.0, 1.0 - 0.5 * l1)
+
+"""
+setup_vocabulary.py — one-time fetch + convert of the real ORB vocabulary.
+
+Run this once:  python3 setup_vocabulary.py
+
+Downloads the official ORB-SLAM3 pre-trained vocabulary (ORBvoc.txt.tar.gz,
+~42MB, from github.com/UZ-SLAMLab/ORB_SLAM3 -- the same vocabulary real
+ORB-SLAM3 itself ships with), parses its DBoW2 text format, and caches it
+as a compressed .npz (~31MB) for fast loading (~0.4s vs ~11s to re-parse
+the raw text every startup).
+
+NOT bundled as a pre-built file in this project's delivery zip -- 30MB+
+binary caches don't belong in a code drop, and re-running this script is
+a one-time, ~90-second cost on a real machine with internet access.
+
+FORMAT (reverse-engineered and verified against the actual file, not
+assumed from documentation -- see PROGRESS.md's Phase 5 section for the
+verification methodology):
+  Header line: "k L scoring_type weighting_type" (k=10, L=6 for the
+  standard ORB-SLAM3 vocabulary: a 10-ary tree, 6 levels deep).
+  Each following line: "parent_id word_id desc[0..31] weight"
+    parent_id: 0 = virtual root; otherwise 1-indexed node id (this row's
+               own node id is its line number, 1-indexed).
+    word_id:   0 for inner nodes; nonzero (sequential) for leaf/word nodes.
+    desc:      32 bytes (0-255), the node's representative ORB descriptor.
+    weight:    IDF weight, meaningful only for leaf/word nodes (0 for
+               inner nodes, and also legitimately 0 for very common words).
+  Verified: children of a given parent are ALWAYS stored as a contiguous
+  run of rows (checked exhaustively across all 1,082,072 rows, zero
+  violations) -- this is what allows an O(1)-per-level array-based tree
+  instead of a slow reverse-lookup structure.
+"""
+
+import os
+import sys
+import time
+import tarfile
+import urllib.request
+
+import numpy as np
+
+VOCAB_URL = "https://raw.githubusercontent.com/UZ-SLAMLab/ORB_SLAM3/master/Vocabulary/ORBvoc.txt.tar.gz"
+CACHE_PATH = os.path.join(os.path.dirname(__file__), "orbvoc_cache.npz")
+
+
+def parse_orbvoc_txt(path):
+    parent, word_id, descs, weight = [], [], [], []
+    with open(path) as f:
+        header = f.readline().split()
+        k, L = int(header[0]), int(header[1])
+        for line in f:
+            parts = line.split()
+            parent.append(int(parts[0]))
+            word_id.append(int(parts[1]))
+            descs.append([int(x) for x in parts[2:34]])
+            weight.append(float(parts[34]))
+    return (k, L, np.array(parent, dtype=np.int32), np.array(word_id, dtype=np.int32),
+           np.array(descs, dtype=np.uint8), np.array(weight, dtype=np.float32))
+
+
+def build_child_index(parent):
+    """
+    child_start[node_id] / child_count[node_id]: O(1) lookup of a node's
+    children, exploiting the verified contiguity property (see module
+    docstring). node_id=0 is the virtual root; node ids 1..N are rows
+    0..N-1 (node_id = row_index + 1).
+    """
+    n_nodes = len(parent)
+    change_points = np.where(np.diff(parent) != 0)[0] + 1
+    run_starts = np.concatenate([[0], change_points])
+    run_ends = np.concatenate([change_points, [n_nodes]])
+    run_parent = parent[run_starts]
+
+    child_start = np.full(n_nodes + 1, -1, dtype=np.int32)
+    child_count = np.zeros(n_nodes + 1, dtype=np.uint16)
+    for s, e, p in zip(run_starts, run_ends, run_parent):
+        child_start[p] = s
+        child_count[p] = e - s
+    return child_start, child_count
+
+
+def main():
+    if os.path.exists(CACHE_PATH):
+        print(f"{CACHE_PATH} already exists. Delete it first to rebuild.")
+        return
+
+    txt_path = "/tmp/ORBvoc.txt"
+    tar_path = "/tmp/ORBvoc.txt.tar.gz"
+
+    if not os.path.exists(txt_path):
+        print(f"Downloading {VOCAB_URL} ...")
+        t0 = time.time()
+        urllib.request.urlretrieve(VOCAB_URL, tar_path)
+        print(f"  done in {time.time()-t0:.1f}s ({os.path.getsize(tar_path)/1e6:.1f} MB)")
+
+        print("Extracting ...")
+        with tarfile.open(tar_path) as tf:
+            tf.extractall("/tmp")
+
+    print("Parsing (one-time, ~11s for the full vocabulary) ...")
+    t0 = time.time()
+    k, L, parent, word_id, descs, weight = parse_orbvoc_txt(txt_path)
+    print(f"  parsed {len(parent)} nodes in {time.time()-t0:.1f}s (k={k}, L={L})")
+
+    print("Building tree index ...")
+    child_start, child_count = build_child_index(parent)
+
+    print(f"Saving cache to {CACHE_PATH} ...")
+    np.savez_compressed(CACHE_PATH, k=k, L=L, parent=parent, word_id=word_id,
+                        descs=descs, weight=weight,
+                        child_start=child_start, child_count=child_count)
+    print(f"  done ({os.path.getsize(CACHE_PATH)/1e6:.1f} MB)")
+    print("\nSetup complete. orb_vocabulary.py will load this cache automatically.")
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+keyframe_database.py — Phase 5: inverted index over BoW words -> keyframes.
+
+Maps to: ORB_SLAM3/src/KeyFrameDatabase.cc
+
+WHY THIS EXISTS: the original loop_closing.py searched candidates with
+`for kf in world_map.keyframes: sim = vocab.similarity(...)` -- brute
+force over ONE map's keyframes, recomputing every comparison from
+scratch. Two problems this fixes:
+
+1. Speed: with a real ~1,000,000-word vocabulary (orb_vocabulary.py),
+   two frames' BoW vectors are sparse (a few hundred nonzero words each
+   out of ~1,000,000 possible) -- most keyframe pairs share ZERO words
+   and are trivially not candidates. An inverted index (word -> which
+   keyframes contain it) finds the keyframes worth comparing directly,
+   instead of scoring every keyframe against every other one.
+
+2. Scope: this index is ATLAS-WIDE by construction (add_keyframe takes
+   a keyframe reference regardless of which Map object it belongs to).
+   This is what makes relocalization.py's job possible at all -- the
+   original architectural gap (flagged from the very first forensic
+   pass on this project) was that a camera returning to a real, already-
+   mapped place after a tracking-loss-induced map fragmentation could
+   never be recognized, because the search never looked outside the
+   currently active map. This index has no notion of "which map is
+   active" at all -- it just tracks word -> keyframe id.
+"""
+
+import numpy as np
+
+
+class KeyFrameDatabase:
+    def __init__(self, vocab):
+        self.vocab = vocab
+        self.inverted_index = {}        # word_id -> set(keyframe_id)
+        self.keyframe_bows = {}         # keyframe_id -> bow_vector dict
+        self.keyframe_refs = {}         # keyframe_id -> Frame object (for the caller to get pose/descriptors/map)
+
+    def add_keyframe(self, keyframe):
+        """
+        Computes and stores the keyframe's BoW vector, updating the
+        inverted index. Idempotent -- re-adding an already-present
+        keyframe id first removes its old entries (handles the case
+        where a keyframe's descriptors could theoretically change,
+        though in practice keyframes are immutable once created).
+        """
+        if keyframe.id in self.keyframe_bows:
+            self.remove_keyframe(keyframe.id)
+
+        bow, _ = self.vocab.transform(keyframe.descriptors)
+        self.keyframe_bows[keyframe.id] = bow
+        self.keyframe_refs[keyframe.id] = keyframe
+        for word_id in bow:
+            self.inverted_index.setdefault(word_id, set()).add(keyframe.id)
+
+    def remove_keyframe(self, kf_id):
+        """Call when a keyframe is culled (local_mapping.cull_keyframes())
+        -- otherwise the index accumulates dangling entries pointing at
+        keyframes no longer in any live Map."""
+        bow = self.keyframe_bows.pop(kf_id, None)
+        self.keyframe_refs.pop(kf_id, None)
+        if bow is None:
+            return
+        for word_id in bow:
+            s = self.inverted_index.get(word_id)
+            if s is not None:
+                s.discard(kf_id)
+                if not s:
+                    del self.inverted_index[word_id]
+
+    def query(self, bow_vector, exclude_ids=None, min_shared_words=1, top_n=10):
+        """
+        Returns up to top_n candidate keyframe ids, ranked by DBoW2 score
+        (not just shared-word count -- count is used only as a cheap
+        first-pass filter before the more expensive score() call, exactly
+        the two-stage design real DBoW2 databases use).
+
+        exclude_ids: keyframe ids to skip entirely (e.g. the querying
+        keyframe's own recent covisibility neighbors, so relocalization/
+        loop detection isn't just "matching against the frame right
+        before this one" -- ORB-SLAM3 excludes covisible keyframes from
+        loop/relocalization candidates for the same reason).
+        """
+        exclude_ids = exclude_ids or set()
+        shared_count = {}
+        for word_id in bow_vector:
+            for kf_id in self.inverted_index.get(word_id, ()):
+                if kf_id in exclude_ids:
+                    continue
+                shared_count[kf_id] = shared_count.get(kf_id, 0) + 1
+
+        candidates = [kf_id for kf_id, c in shared_count.items() if c >= min_shared_words]
+        if not candidates:
+            return []
+
+        scored = [(kf_id, self.vocab.score(bow_vector, self.keyframe_bows[kf_id]))
+                 for kf_id in candidates]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_n]
+
+    def n_keyframes(self):
+        return len(self.keyframe_bows)
+
+
+
+
