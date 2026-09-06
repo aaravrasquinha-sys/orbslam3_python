@@ -66,7 +66,21 @@ def init_monocular(frame_a, frame_b, matcher, camera, world_map,
     frame_a becomes the world origin; frame_b's pose is estimated relative to it.
     Returns (success, new_points).
     """
-    matches = matcher.match(frame_a.descriptors, frame_b.descriptors)
+    # BUGFIX (Phase 3): plain crossCheck match() -> ratio test + rotation
+    # histogram. Unlike tracking.py's _solve_pnp (see that file's comment
+    # for why the rotation filter does NOT apply there), this genuinely IS
+    # frame-vs-frame matching -- both frame_a.keypoints and
+    # frame_b.keypoints carry real, single-observation angles, which is
+    # exactly what rotation_consistency_filter() needs. Two-view mono
+    # initialization is also the highest-stakes place in the whole
+    # pipeline for a bad correspondence to sneak in silently: an outlier
+    # match here doesn't just get RANSAC-rejected in one frame's pose
+    # estimate, it can corrupt the very first map points the rest of the
+    # map gets built from.
+    matches = matcher.match_ratio(frame_a.descriptors, frame_b.descriptors)
+    if len(matches) >= 30:
+        matches = matcher.rotation_consistency_filter(
+            matches, frame_a.keypoints, frame_b.keypoints)
     if len(matches) < min_matches:
         return False, []
 
