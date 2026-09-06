@@ -9,8 +9,16 @@ Maps to: ORB_SLAM3/src/ORBmatcher.cc
 
 SIMPLIFICATIONS:
   - Brute force over all descriptors. Real ORB-SLAM3 narrows candidates first
-    using a pixel grid (GetFeaturesInArea) or BoW vocabulary buckets.
-  - No rotation-consistency histogram filter (ComputeThreeMaxima).
+    using a pixel grid (GetFeaturesInArea) or BoW vocabulary buckets --
+    NOTE: the pixel-grid version IS used already, in tracking.py's
+    _track_local_map (via frame.get_features_in_area), just not here in
+    the generic match()/match_ratio() calls used by initializer.py,
+    local_mapping.py, and loop_closing.py.
+  - Rotation-consistency histogram (rotation_consistency_filter(), added
+    Phase 3) exists now but is only wired into tracking.py's _solve_pnp
+    so far -- local_mapping.py's fusion search and loop_closing.py's
+    candidate verification don't use it yet (Phase 5/6 territory, where
+    loop closing itself becomes reachable).
 """
 
 import cv2
@@ -66,6 +74,48 @@ class Matcher:
             if m.distance < self.nn_ratio * n.distance and m.distance <= self.max_distance:
                 good.append(m)
         return sorted(good, key=lambda m: m.distance)
+
+    @staticmethod
+    def rotation_consistency_filter(matches, kp_a, kp_b, n_bins=30):
+        """
+        ORBmatcher::ComputeThreeMaxima -- BUGFIX/ADDITION: this did not
+        exist at all before (module docstring's own SIMPLIFICATIONS note
+        listed it as missing). Real ORB-SLAM3 uses this on every matching
+        call, not just loop closing: matched keypoint pairs from two
+        views of a genuinely rigid scene should all show roughly the SAME
+        relative rotation (kp_b.angle - kp_a.angle), since the whole rBRIEF
+        pipeline is built around cancelling out per-keypoint rotation. A
+        real correspondence agrees with the dominant rotation; a false
+        correspondence (found by a coincidentally-similar-looking but
+        wrong descriptor match) usually doesn't. This buckets the angle
+        differences into `n_bins`, keeps only matches falling in the 3
+        largest bins, and discards the rest as likely-false correspondences
+        -- independent of and complementary to the ratio test, which
+        filters on descriptor distance alone and has no way to use this
+        geometric consistency signal at all.
+
+        matches: list of cv2.DMatch. kp_a/kp_b: the two full keypoint
+        lists matches were computed from (angle in degrees, cv2 convention).
+        Returns the filtered match list, sorted best-distance-first (same
+        convention as match()/match_ratio()).
+        """
+        if len(matches) < n_bins:
+            return matches  # too few matches for histogram voting to be meaningful
+
+        bins = [[] for _ in range(n_bins)]
+        for m in matches:
+            da = kp_b[m.trainIdx].angle - kp_a[m.queryIdx].angle
+            if da < 0:
+                da += 360.0
+            b = min(n_bins - 1, int(da * n_bins / 360.0))
+            bins[b].append(m)
+
+        # top 3 bins by count, matching ORB-SLAM3's HISTO_LENGTH=30 /
+        # keep-3-largest convention exactly (ComputeThreeMaxima)
+        order = sorted(range(n_bins), key=lambda b: len(bins[b]), reverse=True)
+        keep_bins = set(order[:3])
+        kept = [m for b in keep_bins for m in bins[b]]
+        return sorted(kept, key=lambda m: m.distance)
 
     @staticmethod
     def matched_points(kp_a, kp_b, matches):
