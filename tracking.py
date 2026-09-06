@@ -299,7 +299,31 @@ class Tracking:
         if frame.descriptors is None or len(frame.descriptors) == 0:
             return False
 
-        matches = self.matcher.match(frame.descriptors, mp_descs)
+        # BUGFIX (Phase 3): this used to be self.matcher.match(...) --
+        # crossCheck-only, no ratio test. match_ratio() existed as a
+        # method since Phase 0 but was never actually called from
+        # anywhere in the live tracking path. Real logs (frame ~145 in
+        # the original D435i debugging session) showed exactly the
+        # failure mode this fixes: raw match counts stayed high (50-70)
+        # through a rotation, but RANSAC inliers collapsed to 0-9 --
+        # consistent with descriptor ambiguity producing plausible-
+        # looking but geometrically wrong correspondences that crossCheck
+        # alone doesn't catch.
+        #
+        # NOTE ON WHAT WASN'T ADDED HERE: matcher.py's new
+        # rotation_consistency_filter() is NOT applied at this call site.
+        # It needs a genuine second VIEW with real per-keypoint angles on
+        # both sides (matching corners under one rigid rotation should
+        # agree on angle delta). `mp_descs` here is each MapPoint's single
+        # representative descriptor -- chosen via median-Hamming distance
+        # across potentially dozens of past observations from different
+        # viewpoints (see map_point.py's update_descriptor) -- which has
+        # no single meaningful "angle" to compare against. Applying the
+        # rotation histogram here would be comparing frame.keypoints'
+        # angles against a quantity that isn't a real angle at all. See
+        # initializer.py for where this technique IS correctly applicable
+        # (genuine frame-vs-frame matching, both sides real keypoints).
+        matches = self.matcher.match_ratio(frame.descriptors, mp_descs)
         if len(matches) < self.min_matches_for_pose:
             return False
 
