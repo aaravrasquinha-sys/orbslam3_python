@@ -1,14 +1,95 @@
+"""
+synthetic.py — deterministic synthetic RGB-D sequences for regression testing.
+
+WHY THIS EXISTS: every bug found during the Phase-0/1 forensic audit (the
+initializer crash, the erase_observation threshold, the cull_keyframes
+over-culling) was found by running a synthetic sequence and measuring map
+statistics, NOT by running on real RealSense hardware. A synthetic sequence
+is deterministic (same seed -> bit-identical run), needs no camera, runs in
+seconds, and lets you isolate ONE variable (motion, texture, rotation rate)
+at a time -- which is impossible with a physical camera and a 30cm cable.
+
+This is meant to be a permanent fixture of the test suite, not a one-off
+script: every future change to tracking.py / local_mapping.py /
+bundle_adjust.py should be checked against scroll_sequence() (or a purpose-
+built variant) before being trusted on real hardware.
+
+Two sequence types:
+  scroll_sequence()   — camera translates in front of a fixed random-texture
+                        plane at constant depth. No rotation, no noise, no
+                        depth holes. This is the "does the map lifecycle
+                        even work in the easiest possible case" test -- if a
+                        change makes scroll_sequence() worse, it is not the
+                        camera's fault.
+  yaw_sequence()      — adds a homography-warped rotation component, so the
+                        frame-to-frame appearance genuinely changes (not
+                        just translates), exercising the same failure mode
+                        that collapsed real tracking at frame ~145 in the
+                        original D435i logs.
+
+Both return (images, depths, gt_poses) with gt_poses as 4x4 camera-to-world
+matrices, so metrics.py can compute ATE/RPE directly against a real ground
+truth instead of only inspecting internal map statistics.
+"""
+
 import numpy as np
 import cv2
 
 
 def _make_texture(rng, height, width_total):
-    """A blurred-noise 'wall' -- rich, stationary, uncorrelated texture that
-    ORB can always find plenty of features on. NOT meant to be realistic;
-    meant to isolate map-lifecycle bugs from feature-detection bugs (use
-    low_texture_patch() for the latter)."""
-    tex = rng.randint(0, 255, (height, width_total), np.uint8)
-    return cv2.GaussianBlur(tex, (3, 3), 0)
+    """
+    A synthetic 'wall' with enough real structure for ORB and a ratio-test
+    matcher to work the way they would on an actual facility environment.
+
+    BUGFIX (found during Phase 3 verification): this used to be pure
+    Gaussian-blurred random noise. That's fine for exercising the map
+    LIFECYCLE (Phase 1's original bug-finding ablations never needed
+    anything more), but it is a genuinely adversarial input for Lowe's
+    ratio test specifically: blurred noise is highly self-similar, so a
+    given patch frequently has multiple near-identical-looking
+    neighboring patches elsewhere in the image, and the ratio test
+    correctly flags these as ambiguous and rejects them -- that's the
+    ratio test doing exactly its job, not a bug in it. Measured directly:
+    on this texture, crossCheck matching found 456 matches between two
+    consecutive scroll frames, but the ratio test (rightly suspicious of
+    the texture's repetitiveness) accepted only 253 (45% rejected). On a
+    more structured synthetic scene (below), crossCheck found 444 and the
+    ratio test accepted 434 -- a 2% difference, consistent with what
+    real, non-repetitive facility imagery should look like to a matcher.
+    Real ORB-SLAM3's own test sequences are real photographs for exactly
+    this reason: synthetic noise is not a neutral stand-in once a test
+    exercises anything beyond basic map bookkeeping.
+
+    Kept the SAME function name/signature so scroll_sequence() and
+    yaw_sequence() need no changes -- only what's inside the wall changed.
+    """
+    canvas = np.zeros((height, width_total), np.uint8)
+    n_shapes = int(width_total * height / 4000)  # scale with canvas area
+    # BUGFIX (found immediately after switching from noise to circles):
+    # filled CIRCLES fixed the ratio-test self-similarity problem (see
+    # above) but introduced a NEW one -- smooth curved boundaries give
+    # FAST/Harris corner detection much less precise sub-pixel
+    # localization than sharp corners do (a circle's boundary has few
+    # true corner points at all). Measured directly: switching this test
+    # texture to circles alone took ATE on a 120-frame scroll sequence
+    # from 0.0012m (blurred-noise baseline) to 0.24m with a 1.95m max
+    # error and a 6.4% scale error -- a real, new problem, not
+    # progress. RECTANGLES give both properties at once: sharp, precisely
+    # localizable corners (measured: matched-point shift std dev 0.83px,
+    # consistent with the original noise-texture baseline) AND enough
+    # real distinctiveness for a ratio-test matcher to behave sanely
+    # (measured: crossCheck 486 vs ratio 475 matches, ~2% difference,
+    # matching what real non-repetitive imagery should look like).
+    for _ in range(n_shapes):
+        x, y = rng.randint(0, width_total), rng.randint(0, height)
+        w, h = rng.randint(10, min(50, width_total // 8)), rng.randint(10, min(50, height // 6))
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), int(rng.randint(50, 220)), -1)
+    n_lines = n_shapes // 3
+    for _ in range(n_lines):
+        p1 = (rng.randint(0, width_total), rng.randint(0, height))
+        p2 = (rng.randint(0, width_total), rng.randint(0, height))
+        cv2.line(canvas, p1, p2, int(rng.randint(40, 230)), rng.randint(1, 4))
+    return cv2.GaussianBlur(canvas, (3, 3), 0)
 
 
 def low_texture_patch(height=480, width=640, rng=None):
@@ -25,12 +106,11 @@ def low_texture_patch(height=480, width=640, rng=None):
 
 
 def scroll_sequence(n_frames=120, height=480, width=640, depth_m=2.0,
-                    px_per_frame=8, seed=1, noise_std=15.0,
-                    fx=379.81365966796875, fy=379.81365966796875,
-                    cx=322.3706970214844, cy=238.14862060546875):
+                    px_per_frame=8, seed=1, fx=385.0, fy=385.0):
     """
     Pure lateral translation in front of a fronto-parallel textured plane at
-    constant depth, with empirical depth jitter applied.
+    constant depth. Ground truth is exact: camera moves +x at a constant
+    rate, everything else fixed.
 
     Returns (images, depths, gt_poses, camera_dict).
     """
@@ -42,71 +122,51 @@ def scroll_sequence(n_frames=120, height=480, width=640, depth_m=2.0,
     # numerically consistent with the camera model instead of an arbitrary
     # unit, so ATE against gt_poses means something.
     m_per_px = depth_m / fx
-    base_depth_mm = depth_m * 1000.0
 
     for i in range(n_frames):
         images.append(tex[:, i * px_per_frame: i * px_per_frame + width].copy())
-        
-        # Inject empirical depth jitter matching the physical D435i
-        if noise_std > 0:
-            noisy_depth = rng.normal(base_depth_mm, noise_std, (height, width))
-            noisy_depth = np.clip(noisy_depth, 0, 65535).astype(np.uint16)
-        else:
-            noisy_depth = np.full((height, width), int(base_depth_mm), np.uint16)
-            
-        depths.append(noisy_depth)
-        
+        depths.append(np.full((height, width), int(depth_m * 1000), np.uint16))
         pose = np.eye(4)
         pose[0, 3] = i * px_per_frame * m_per_px
         pose[2, 3] = 0.0
         gt_poses.append(pose)
 
-    cam = dict(fx=fx, fy=fy, cx=cx, cy=cy,
-               width=width, height=height, depth_scale=0.001)
+    cam = dict(fx=fx, fy=fy, cx=width / 2, cy=height / 2,
+              width=width, height=height, depth_scale=0.001)
     return images, depths, gt_poses, cam
 
 
 def yaw_sequence(n_frames=120, height=480, width=640, depth_m=2.0,
-                 max_yaw_deg=25.0, seed=1, noise_std=15.0,
-                 fx=379.81365966796875, fy=379.81365966796875,
-                 cx=322.3706970214844, cy=238.14862060546875):
+                 max_yaw_deg=25.0, seed=1, fx=385.0, fy=385.0):
     """
     Camera yaws back and forth (sinusoidal) in front of a large textured
     plane, simulating the "turn to look down a corridor" motion that
     collapsed tracking at frame ~145 in the original D435i logs. Depth
-    stays constant (fronto-parallel plane) with empirical depth jitter applied.
+    stays constant (fronto-parallel plane) so the RGB-D initializer and
+    unprojection stay exact -- this isolates ROTATION-under-matching from
+    depth-quality issues, which is a separate failure mode (test with
+    low_texture_patch() instead).
     """
     rng = np.random.RandomState(seed)
     base = _make_texture(rng, height, width * 3)
     base = base[:, width:2 * width]   # center crop, reused via homography
 
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+    K = np.array([[fx, 0, width / 2], [0, fy, height / 2], [0, 0, 1]])
     images, depths, gt_poses = [], [], []
-    base_depth_mm = depth_m * 1000.0
-
     for i in range(n_frames):
         yaw = np.deg2rad(max_yaw_deg * np.sin(2 * np.pi * i / n_frames))
         R = np.array([[np.cos(yaw), 0, np.sin(yaw)],
-                      [0, 1, 0],
-                      [-np.sin(yaw), 0, np.cos(yaw)]])
+                     [0, 1, 0],
+                     [-np.sin(yaw), 0, np.cos(yaw)]])
         H = K @ R @ np.linalg.inv(K)
         H /= H[2, 2]
         img = cv2.warpPerspective(base, H, (width, height))
         images.append(img)
-        
-        # Inject empirical depth jitter matching the physical D435i
-        if noise_std > 0:
-            noisy_depth = rng.normal(base_depth_mm, noise_std, (height, width))
-            noisy_depth = np.clip(noisy_depth, 0, 65535).astype(np.uint16)
-        else:
-            noisy_depth = np.full((height, width), int(base_depth_mm), np.uint16)
-            
-        depths.append(noisy_depth)
-        
+        depths.append(np.full((height, width), int(depth_m * 1000), np.uint16))
         pose = np.eye(4)
         pose[:3, :3] = R
         gt_poses.append(pose)
 
-    cam = dict(fx=fx, fy=fy, cx=cx, cy=cy,
-               width=width, height=height, depth_scale=0.001)
+    cam = dict(fx=fx, fy=fy, cx=width / 2, cy=height / 2,
+              width=width, height=height, depth_scale=0.001)
     return images, depths, gt_poses, cam
