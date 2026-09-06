@@ -3317,6 +3317,356 @@ class LoopClosing:
         return float(np.linalg.norm(kf_a.camera_center() - kf_b.camera_center()))
 
 
+# Field Log — Phase 5 Hardware Verification (Real BoW + Relocalization)
+
+Same rules as before: actual command output, not a prose summary. Phase
+5 has NOT been tested on real hardware at all yet. Write "N/A" rather
+than skip a field silently.
+
+---
+
+## 0. Environment
+
+```bash
+ls -la orbvoc_cache.npz
+python3 -c "from orb_vocabulary import ORBVocabulary; v=ORBVocabulary().load(); print('n_words:', v.n_words)"
+```
+**Paste output:**
+```
+[paste here]
+```
+**n_words shown above:** _______ (expect 971814 — if much smaller, see RUNBOOK_PHASE5.md §4.2)
+
+---
+
+## 1. Synthetic gates
+
+```bash
+python3 test_phase5_gate.py 2>&1 | tail -30
+```
+**Paste the full tail output:**
+```
+[paste here]
+```
+**Phase 5 Test 3 numbers** (tracking losses forced / relocalizations recorded / final Atlas map count): _______ / _______ / _______
+
+---
+
+## 2. Controlled revisit test
+
+Map a small area (a few keyframes worth), then deliberately break
+tracking (walk away, cover the lens briefly, or point at a genuinely
+blank/featureless area for several seconds), then return to the
+original area.
+
+Command run:
+```
+[paste here]
+```
+**Final summary block:**
+```
+[paste here]
+```
+**Relocalization count:**
+```python
+print(slam.stats.get('relocalizations', 'not tracked'))
+```
+```
+[paste here]
+```
+**Atlas structure before and after** (`slam.atlas.summary()` at both points, if you can capture it):
+```
+before:
+[paste here]
+
+after:
+[paste here]
+```
+**Any `[reloc]` log lines?** [ ] Yes [ ] No — paste them if yes:
+```
+[paste here]
+```
+
+---
+
+## 3. Dense fallback A/B on real hardware (optional but valuable)
+
+If your test setup allows toggling `slam.tracking.use_dense_fallback`,
+repeat the SAME physical revisit/loss motion twice — once with it True,
+once False — and compare tracking-loss counts.
+
+**Dense fallback OFF — final summary:**
+```
+[paste here]
+```
+**Dense fallback ON — final summary:**
+```
+[paste here]
+```
+**Losses compared:** _______ (fewer/more/same with fallback on)
+
+**If you have access to log `photometric_residual` values** (RUNBOOK_PHASE5.md §4.4),
+paste a few real-hardware residual values here — this is the single most
+useful number for deciding whether `max_photometric_residual=20.0` needs
+retuning for real sensor noise:
+```
+[paste here]
+```
+
+---
+
+## 4. The 30cm-forward/turn/30cm-back loop test
+
+Command run:
+```
+[paste here]
+```
+**Final summary block + map_health() dict:**
+```
+[paste here]
+```
+**Relocalization count during this run:** _______ (may legitimately be 0 — see RUNBOOK_PHASE5.md §5)
+
+---
+
+## 5. Self-check before sending
+
+- [ ] Vocabulary loaded with a real word count (~971,814), not 1 or 64
+- [ ] Cross-referenced RUNBOOK.md/RUNBOOK_PHASE2-4.md's known-expected items before flagging anything as new
+- [ ] If relocalization count was 0, checked whether tracking ever actually reached a sustained LOST state at all (RUNBOOK_PHASE5.md §4.3)
+- [ ] Noted whether dense-fallback A/B looks like partial help (expected, ~50% in synthetic testing) rather than 0% or 100% (both suspicious — see RUNBOOK_PHASE5.md §6)
+
+---
+
+## 6. Anything else noticed
+
+```
+[paste here]
+```
+
+
+
+# Phase 3 Runbook — Extractor & Matcher Rewrite
+
+Companion to `RUNBOOK.md` (Phase 0/1) and `RUNBOOK_PHASE2.md` (GTSAM).
+Assumes both are already in place. This one is unusual: half the real
+bugs it found weren't in the extractor or matcher at all — read §4
+carefully, especially 4.4-4.6, before assuming a symptom is extractor-
+related just because this was "the extractor phase."
+
+---
+
+## 1. What changed, in one paragraph
+
+`extractor.py` went from a bare `cv2.ORB_create()` call to per-level grid
+FAST detection with an adaptive-threshold fallback and grid-based spatial
+distribution, with descriptors computed via a patch-based
+`detectAndCompute()` call (required for correct rotation invariance —
+OpenCV's `.compute()` silently skips it on manually-built keypoints).
+`matcher.py` gained a rotation-consistency histogram, wired into
+`initializer.py`'s two-view matching (not `tracking.py`'s `_solve_pnp`,
+where it doesn't apply). Along the way, two unrelated but serious bugs
+were found and fixed: `vocabulary.py`'s KMeans placeholder took 133
+seconds in one call once fed richer real data, and `config.py`'s BA
+backend was still defaulting to `scipy`, which Phase 3's richer maps push
+into a multi-second-per-call regime even under normal operation.
+
+---
+
+## 2. Architecture map
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  UNCHANGED FROM PHASE 1/2                                      │
+│    Everything in RUNBOOK.md and RUNBOOK_PHASE2.md still applies │
+├─────────────────────────────────────────────────────────────┤
+│  NEW THIS PHASE                                                 │
+│    extractor.py     — full rewrite, see PROJECT_SUMMARY.md §7  │
+│    matcher.py        — rotation_consistency_filter() added      │
+│    tracking.py        — _solve_pnp uses match_ratio() now        │
+│    initializer.py      — init_monocular uses ratio+rotation now   │
+├─────────────────────────────────────────────────────────────┤
+│  FIXED IN PASSING (found because of Phase 3, not Phase 3 itself)│
+│    vocabulary.py     — KMeans sample cap + n_words clamp        │
+│    config.py          — bundle_adjust default backend -> gtsam   │
+│    synthetic.py        — texture generator rewritten (test-only)  │
+├─────────────────────────────────────────────────────────────┤
+│  STILL NOT DONE — unaffected by Phase 3                        │
+│    Dense RGB-D fallback, real BoW, loop closing, IMU wiring      │
+│    — see RUNBOOK.md / PROJECT_SUMMARY.md                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Pre-flight checklist
+
+**3.1 — Confirm the files landed.**
+```bash
+grep -c "BUGFIX\|Bug 1\|Bug 2\|Bug 3" extractor.py matcher.py vocabulary.py
+```
+Expect nonzero on all three.
+
+**3.2 — Confirm the default backend actually changed.**
+```bash
+python3 -c "from config import DEFAULT_CONFIG as c; print(c['bundle_adjust']['backend'])"
+```
+Should print `gtsam`, not `scipy`. If your local config was hand-edited
+after Phase 2, this diff may not have applied cleanly — check manually.
+
+**3.3 — Run the full three-phase gate before touching hardware.**
+```bash
+python3 test_phase1_gate.py && python3 test_phase2_gate.py && python3 test_phase3_gate.py
+```
+All three should pass, and the *whole set* should complete in roughly a
+minute or two. If any of them takes several minutes or hangs, don't
+proceed to hardware — see §4.4/4.5 below, that exact symptom has a known
+cause and a known fix already applied; if it recurs, something didn't
+land correctly.
+
+**3.4 — Expect a printed warning, not silence.**
+```
+[vocabulary] WARNING: n_words=10000 requested, but this is the KMeans PLACEHOLDER...
+```
+This is supposed to print once loop closing's config is read. Its
+absence would be more suspicious than its presence — it means the clamp
+isn't running.
+
+---
+
+## 4. Symptom → diagnosis → fix
+
+### 4.1 — Extraction feels slow per frame
+
+**Expected, bounded, not a regression on its own.** The new extractor
+does real per-cell FAST detection and per-keypoint patch-based
+description instead of one bare OpenCV call. Measured in this project's
+environment: ~150-250ms per 640x480 frame (vs. a few ms for the old bare
+call). This is fine for offline processing but will feel very different
+from before if you're used to near-instant extraction. What's NOT
+expected is minutes per frame — if you see that, it's almost certainly
+§4.4 (wrong BA backend), not the extractor itself. Isolate before
+assuming:
+```python
+import time
+t0 = time.time(); kps, descs = extractor.extract(image); print(time.time()-t0)
+```
+
+### 4.2 — Rotation invariance regression (matches degrade badly under camera rotation)
+
+This is the single easiest thing to accidentally break if anyone touches
+`extractor.py`'s `_describe_keypoints()`. The specific failure mode: if
+someone "simplifies" it back to calling `.compute()` on the pre-selected
+keypoints directly (instead of re-running `detectAndCompute()` on a
+patch), rotation invariance silently disappears — OpenCV does not error,
+it just returns descriptors with no real orientation compensation.
+`test_phase3_gate.py`'s Test 3 exists specifically to catch this; run it
+after any extractor edit:
+```bash
+python3 -c "import test_phase3_gate as t; t.test_rotation_invariance()"
+```
+Expect mean Hamming distance well under 110/256 (random baseline ~128).
+If it creeps back up toward 120+, this is the regression.
+
+### 4.3 — Keypoints look substituted / jump to a nearby-but-wrong location
+
+Check `self._orb_describe`'s `nfeatures` parameter in `extractor.py`'s
+`__init__`. It must be a reasonably large number (currently 30), not 1 —
+with `nfeatures=1`, the patch-describe step returns only the single
+globally-strongest corner anywhere in the patch, which is frequently NOT
+the intended location. This was a real bug found and fixed during Phase
+3; if it recurs, the rotation-invariance test in §4.2 will also degrade,
+since both symptoms share the same root cause.
+
+### 4.4 — Everything is dramatically slower than expected; a single BA call takes seconds
+
+**Check the backend first, before touching anything else:**
+```python
+print(slam.cfg["bundle_adjust"]["backend"])
+```
+If this says `scipy`, that's very likely the entire problem. Phase 3's
+richer, better-distributed keypoints mean more valid points/observations
+per keyframe than before — enough on its own to push scipy's solver to
+multi-second-per-call territory even under completely normal (non-
+pathological) operation, which is why the default was changed to
+`gtsam`. If you've overridden config and are intentionally testing
+scipy, this slowness is expected and documented, not a bug. If you
+didn't override it and it still says `scipy`, the config change didn't
+apply — check `config.py` directly.
+
+### 4.5 — The pipeline hangs for ~2 minutes then continues (not a permanent hang, but a very long pause)
+
+This is very likely `vocabulary.py`'s `build()` being called with far
+more clusters than its sample cap safely supports. Check for the
+warning from §3.4 — if it's ABSENT and you still see a long pause right
+around when keyframe count crosses ~20 (the loop-closing gate), the
+`n_words` clamp in `Vocabulary.__init__` may not be applying. Confirm:
+```python
+print(vocab.n_words)  # should be <=256 regardless of config's requested value
+```
+
+### 4.6 — A previously-passing map-health gate now fails after a synthetic-test-only change
+
+If you ever modify `synthetic.py`'s texture generator again, re-run the
+full gate suite before trusting any other change — Phase 3's own history
+is a direct warning here. The texture went through THREE iterations
+(blurred noise → circles+lines → rectangles+lines) because each fixed one
+real problem while silently introducing another (self-similarity broke
+the ratio test; smooth circle boundaries broke corner localization
+precision). A synthetic texture is not a neutral choice once your test
+exercises anything beyond basic bookkeeping — it interacts with real
+algorithmic behavior (ratio-test ambiguity rejection, sub-pixel corner
+precision) in ways that are easy to miss if you only look at one metric
+at a time.
+
+### 4.7 — Map-health numbers on real hardware look different from the synthetic gate's numbers
+
+Expected, within reason — this hasn't been tested on real hardware AT
+ALL yet for Phase 3 (see PROJECT_SUMMARY.md §7). Real depth noise, real
+lighting, and real scene structure (not rectangles and circles) will all
+shift the exact numbers. What should NOT differ qualitatively: rotation
+invariance should still clearly beat random matching, keypoints should
+still appear across more of the image than a single concentrated region,
+and a genuinely blank wall segment should still yield very few
+keypoints — this is physics, not a bug (see RUNBOOK.md §4.4 and this
+runbook's own texture-related notes above).
+
+---
+
+## 5. Testing order
+
+1. Full synthetic gate suite (§3.3) — must pass before anything else.
+2. Point the camera at a mix of textured and low-texture surfaces (a
+  wall with SOME structure — a light switch, a door frame, a sign — not
+  a perfectly blank painted wall, which no detector can help). Confirm
+  keypoints appear across more of the frame than they did before Phase 3,
+  not just concentrated in one corner.
+3. A deliberate rotation test (similar to earlier D435i loop tests).
+  Watch for the frame-145-style collapse signature specifically — it
+  should be reduced, though this hasn't been confirmed on real hardware.
+4. Fill out a field log (see the companion `FIELD_LOG_PHASE3.md`) and
+  send it back before treating Phase 3 as hardware-confirmed.
+
+## 6. What "success" looks like for this phase
+
+1. `test_phase1_gate.py`, `test_phase2_gate.py`, `test_phase3_gate.py`
+  all pass, in well under 2 minutes combined, on your machine.
+2. On real footage: keypoints visibly spread across more of the frame
+  than before (can be checked by drawing keypoints on a saved frame and
+  looking at it — `cv2.drawKeypoints`).
+3. No multi-second pauses during normal operation (confirms both the
+  vocabulary fix and the backend-default fix landed correctly).
+4. Map-health numbers (obs≥4, max observations) on real hardware are the
+  same order of magnitude as the synthetic gate's — not necessarily
+  identical, real data is messier, but not wildly different either.
+
+
+
+
+
+
+
+
 
 Phase 6 — Map Merging, 3D-3D Verification, Atlas-Wide Loop Closing
 
