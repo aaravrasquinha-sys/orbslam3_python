@@ -61,7 +61,19 @@ DEFAULTS = {
         "depth_rel_std_max": 0.02,
     },
     "bundle_adjust": {
-        "backend": "scipy",  # "scipy" (original) or "gtsam" (Phase 2, see PROGRESS.md)
+        # BUGFIX (found during Phase 3 verification): this defaulted to
+        # "scipy" through Phase 2. That was fine when it was still true
+        # that most BA calls stayed small -- but Phase 3's extractor
+        # rewrite gives every keyframe a genuinely richer, better-
+        # distributed set of valid points/observations (that's the whole
+        # point of the rewrite), which is enough on its own to push even
+        # NORMAL, properly-culled BA windows (21-22 keyframes, nothing
+        # pathological) into scipy's slow-scaling regime: measured at
+        # ~6.6s PER CALL, 125.9 of 133.5s total in one 30-frame profile.
+        # GTSAM completed the identical scenario in 5.74s total. Phase 2
+        # built exactly the fix this needs; it just wasn't the default.
+        "backend": "gtsam",  # "scipy" (original, now known to not scale
+                             # past Phase 3's richer maps) or "gtsam"
         "window": 8,
         "max_iter": 15,
         "min_obs_to_optimize": 2,
