@@ -6287,6 +6287,352 @@ class Atlas:
 
 
 
+# Field Log — Phase 6 Hardware Verification (Map Merging + 3D-3D Loop Closing)
+
+Same rules as before: actual command output, not a prose summary. Phase
+6 has NOT been tested on real hardware at all yet. Write "N/A" rather
+than skip a field silently.
+
+---
+
+## 0. Environment
+
+```bash
+python3 -c "from config import DEFAULT_CONFIG as c; print(c['loop_closing'])"
+grep -c "add_observation" tracking.py fusion.py relocalization.py
+```
+**Paste output:**
+```
+[paste here]
+```
+
+---
+
+## 1. Synthetic gates
+
+```bash
+python3 test_phase6_gate.py 2>&1 | tail -40
+```
+**Paste the full tail output:**
+```
+[paste here]
+```
+
+---
+
+## 2. Reference-validity health check (the most important new diagnostic this phase)
+
+Run this on ANY map state you can get access to during/after a real test:
+```python
+total_refs, total_valid = 0, 0
+for m in slam.atlas.maps:
+    for kf in m.keyframes:
+        refs = [x for x in kf.map_point_ids if x is not None]
+        valid = sum(1 for mid in refs if mid in m.map_points)
+        total_refs += len(refs); total_valid += valid
+print(f"{total_valid}/{total_refs} valid ({100*total_valid/total_refs:.1f}%)")
+```
+**Result:** _______ / _______ ( _______ %)  — expect >99%
+
+---
+
+## 3. Real cross-map merge test
+
+Map a small loop (walk a rough rectangle or U-shape), deliberately break
+tracking hard partway through (cover the lens, or walk toward a
+genuinely blank/featureless area) to force Atlas fragmentation, continue
+mapping a DIFFERENT area for a while, then physically return through the
+ORIGINAL loop.
+
+Command run:
+```
+[paste here]
+```
+**Final summary block:**
+```
+[paste here]
+```
+**`slam.stats['loops']`:** _______
+**Atlas structure before the revisit (if captured):**
+```
+[paste here]
+```
+**Atlas structure after:**
+```
+[paste here]
+```
+**Any `[LOOP]` log lines? Paste them (note whether tagged "same map" or "CROSS-MAP"):**
+```
+[paste here]
+```
+
+---
+
+## 4. Pose-graph correction sanity (same-map loop, if one occurs)
+
+If a same-map loop closure fires (not a cross-map merge), note the
+drift value reported in the `[LOOP] ... -> CORRECTED` log line, and if
+you have any independent way to check trajectory accuracy (a marked
+physical start/end point), compare before and after.
+
+**Drift measured at loop closure:** _______ m
+**Physical start/end error, if measurable, before correction:** _______
+**After correction:** _______
+
+---
+
+## 5. The 30cm-forward/turn/30cm-back loop test
+
+Command run:
+```
+[paste here]
+```
+**Final summary block:**
+```
+[paste here]
+```
+**Reference-validity check (§2) on this run's final state:** _______ %
+
+---
+
+## 6. Self-check before sending
+
+- [ ] Reference-validity check reads >99%, not a suspiciously lower number
+- [ ] Cross-referenced earlier runbooks' known-expected items before flagging anything as new
+- [ ] If a cross-map merge happened, confirmed the RIGHT two maps merged (not just "map count went down")
+- [ ] If `detect_loop` never found anything on an obvious revisit, checked the actual BoW score directly (RUNBOOK_PHASE6.md §4.4) before assuming it's broken
+
+---
+
+## 7. Anything else noticed
+
+```
+[paste here]
+```
+
+
+# Phase 6 Runbook — Map Merging, 3D-3D Verification, Atlas-Wide Loop Closing
+
+Companion to the earlier phase runbooks. Read §4.1-4.3 carefully before
+debugging anything related to observation counts, culling behavior, or
+bundle adjustment residuals — this phase found a bug affecting all three
+that predates Phase 6 entirely.
+
+---
+
+## 1. What changed, in one paragraph
+
+Loop closing is now Atlas-wide (searches every map, not just the active
+one) and uses 3D-3D RANSAC verification instead of an Essential-matrix
+check. A confirmed loop is now actually acted on: same-map loops get
+pose-graph correction (code that existed before Phase 6 but was never
+imported anywhere), cross-map loops get genuinely merged (not just
+switched to, which is all Phase 5's relocalization ever did). Along the
+way, a significant pre-existing bug was found: four separate code sites
+set a keyframe's map-point reference without registering the
+corresponding observation on the map point's own side, causing silent,
+severe data corruption (measured: one keyframe had 416 of 419 referenced
+points already deleted) that had been present since before Phase 6 and
+affects far more than loop closing.
+
+---
+
+## 2. Architecture map
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  UNCHANGED FROM PHASE 1-5                                       │
+│    Everything in the earlier runbooks still applies              │
+├─────────────────────────────────────────────────────────────┤
+│  NEW THIS PHASE                                                  │
+│    loop_verification.py — 3D-3D RANSAC (replaces Essential matrix)│
+│    merge_maps.py         — actual map merging, not just switching │
+│    loop_closing.py        — rewritten: Atlas-wide search           │
+│    run_slam.py._handle_loop_result — correction/merge branching   │
+├─────────────────────────────────────────────────────────────┤
+│  VERIFIED FOR THE FIRST TIME (existed before, never tested)      │
+│    pose_graph.py — SE(3) correction, compute_loop_edge            │
+├─────────────────────────────────────────────────────────────┤
+│  FOUND AND FIXED (pre-existing, NOT Phase-6-specific)            │
+│    map.py            — clean_bad_points/erase_map_point didn't    │
+│                        clear keyframe-side references             │
+│    tracking.py (x2)   — map_point_ids set without add_observation │
+│    fusion.py           — survivor point's observations not always │
+│                        registered for an already-established kf   │
+│    relocalization.py   — same missing add_observation pattern      │
+├─────────────────────────────────────────────────────────────┤
+│  STILL NOT DONE                                                  │
+│    IMU wiring (Phase 7), dense reconstruction (Phase 9)           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Pre-flight checklist
+
+**3.1 — Confirm the observation-consistency fix landed.**
+```bash
+grep -c "add_observation" tracking.py fusion.py relocalization.py
+```
+Expect each to show more matches than before this phase (the fix added
+new calls, didn't remove any).
+
+**3.2 — Run the global reference-validity check.** This is the single
+most useful health check this phase introduced — run it on any map
+state you have access to:
+```python
+total_refs, total_valid = 0, 0
+for m in slam.atlas.maps:
+    for kf in m.keyframes:
+        refs = [x for x in kf.map_point_ids if x is not None]
+        valid = sum(1 for mid in refs if mid in m.map_points)
+        total_refs += len(refs); total_valid += valid
+print(f"{total_valid}/{total_refs} valid ({100*total_valid/total_refs:.1f}%)")
+```
+Expect **>99% valid** on any healthy run. This project's own measurement
+before the fix was as low as 0.7% on individual keyframes; after the
+fix, 99.7% globally. If you see anything meaningfully below 99%, that's
+a real regression — see §4.1.
+
+**3.3 — Run the full six-phase gate before hardware.**
+```bash
+python3 test_phase6_gate.py
+```
+This internally re-runs Phases 1-3's gates and independently exercises
+Phases 4-5's own logic through the real pipeline, so it's the single
+most complete check available. Budget several minutes — Test 5
+(end-to-end merge) processes a few hundred synthetic frames through the
+real `SLAMSystem`.
+
+---
+
+## 4. Symptom → diagnosis → fix
+
+### 4.1 — Reference-validity check (§3.2) shows a low percentage again
+
+This is the most important regression to watch for. If you add a new
+code path that sets `keyframe.map_point_ids[i] = mp.id` (or reassigns
+it), it MUST be paired with `mp.add_observation(keyframe.id, i)` in the
+same breath. This project already found and fixed four instances of this
+exact bug (two in `tracking.py`, one each in `fusion.py` and
+`relocalization.py`) — search for the pattern before assuming this is a
+new, different problem:
+```bash
+grep -n "map_point_ids\[.*\] = " *.py
+```
+For every match, confirm an `add_observation` call sits nearby with the
+same `(frame_id, keypoint_index)` pair. This is a real, easy-to-reintroduce
+bug — nothing about the type system or normal testing catches it, since
+the symptom (points silently vanishing from observation counts) doesn't
+crash anything, it just quietly degrades culling decisions and BA
+residual counts until something demands real 3D correspondence data (as
+Phase 6's loop verification did).
+
+### 4.2 — Culling behavior or map-health numbers look better than expected on old test data
+
+Worth knowing: since the stale-reference bug affected `n_observations()`
+counts everywhere (Phase 1's culling gates, bundle adjustment's residual
+counts), fixing it may shift some of Phase 1-3's own numeric baselines
+slightly — this project's own gates already accounted for this (re-run
+and confirmed passing after the fix), but if you have OTHER, external
+baselines recorded from before this phase, don't be alarmed if they
+don't match exactly. More real observations surviving generally means
+*healthier*, not worse, downstream behavior.
+
+### 4.3 — Bundle adjustment cost/behavior changed after this phase
+
+Same root cause as §4.2 — BA (both the scipy and GTSAM versions) counts
+observations via `mp.observations`, which was previously under-reporting
+real correspondences project-wide. More real observations feeding BA is
+expected to change convergence behavior somewhat (generally for the
+better — more real constraints), not a sign this phase broke something.
+
+### 4.4 — `detect_loop()` never finds a candidate even though you can see two views clearly overlap
+
+Check `similarity_thresh` first — if you've reverted to an old config or
+hand-constructed a `LoopClosing` instance without the current default
+(0.20), you may have reintroduced the exact bug found in this phase
+(0.75 rejects everything). Confirm with a direct score check:
+```python
+bow_a, _ = vocab.transform(kf_a.descriptors)
+bow_b, _ = vocab.transform(kf_b.descriptors)
+print(vocab.score(bow_a, bow_b))
+```
+A genuine overlapping view on this project's own synthetic content
+scores ~0.32; real facility photographs should score comparably or
+higher (closer to what the vocabulary was actually trained on).
+
+### 4.5 — A cross-map loop is detected but `verify_3d3d` returns 0 inliers despite plenty of raw descriptor matches
+
+Before assuming a new bug, check the reference-validity health of BOTH
+candidate keyframes (§3.2, applied to just those two). This exact
+symptom (900+ raw matches, 0 valid 3D correspondences) was THE signature
+of the stale-reference bug this phase found — if you see it again after
+confirming §4.1's fix is in place, it's a genuinely new occurrence worth
+investigating with the same tracing technique used in `PROGRESS.md`
+(compare a specific map point's own `observations` dict against what
+every keyframe's `map_point_ids` array claims about it).
+
+### 4.6 — A cross-map merge leaves the Atlas with more than 1 map remaining
+
+Expected in some cases, not automatically a bug. `merge_maps` only folds
+in the SPECIFIC map containing the matched keyframe — an unrelated,
+orphaned fragment elsewhere in the Atlas (e.g. from a brief failed
+re-initialization attempt) has no reason to merge unless something
+specifically revisits it too. Check whether the map that SHOULD have
+merged (the one containing the actual loop-closure keyframes) did —
+that's the correctness claim, not "every map in the Atlas collapsed to
+one."
+
+### 4.7 — `test_phase6_gate.py`'s Test 5 seems to require carefully-tuned synthetic sequence parameters to pass
+
+This is real, and worth understanding rather than fighting blindly if
+you modify the test: a bounded revisit area gets "fully mapped" quickly,
+after which the system correctly STOPS creating new keyframes there —
+healthy behavior, not a bug, but it means naively adding more synthetic
+motion doesn't reliably buy more keyframes past a point (diminishing
+returns). The test works around the production `n_kf % 10 == 0` cadence
+by calling `detect_loop`/`_handle_loop_result` directly rather than
+depending on that exact cadence landing correctly within a finite
+sequence — see `run_slam.py`'s own comment on why this extraction
+exists, and consider the same approach if you're writing further tests
+against loop closing.
+
+---
+
+## 5. Testing order
+
+1. Reference-validity check (§3.2) on a fresh, short recording — confirms
+  the core fix is in place before testing anything more elaborate.
+2. Full synthetic gate suite (§3.3).
+3. A real cross-map merge scenario: map a small loop, deliberately lose
+  tracking hard enough to fragment the Atlas, continue mapping a
+  different area for a while, then physically walk back through the
+  ORIGINAL loop. Check `slam.stats['loops']` and the Atlas structure
+  before/after.
+4. The standard 30cm-forward/turn/30cm-back test, checking whether the
+  reference-validity percentage (§3.2) stays high throughout.
+
+## 6. What "success" looks like for this phase
+
+1. Reference-validity check reads >99% on real hardware footage, not
+  just synthetic tests.
+2. A genuine facility loop (walk a rectangle, end where you started)
+  results in the Atlas resuming/merging into a single map, with
+  `slam.stats['loops'] > 0`.
+3. Pose-graph correction visibly reduces trajectory drift at a confirmed
+  same-map loop closure (compare estimated end-position error before vs.
+  after, if you have any way to measure ground truth on real hardware).
+4. No unexplained drop in map-health numbers compared to Phase 1-5's own
+  baselines — a drop would suggest the reference-validity fix
+  regressed, not just that Phase 6's new logic has its own bug.
+
+
+
+
+
+
+
 
 
 
