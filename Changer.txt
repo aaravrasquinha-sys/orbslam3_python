@@ -1,313 +1,379 @@
-Field Log — Phase 0/1/2 Hardware Verification
-Fill this in on your terminal, then paste the WHOLE thing back to me,
-including command output verbatim. Don't summarize/prose-ify the outputs —
-that's exactly what caused the back-and-forth with the Gemini report. If a
-field doesn't apply, write "N/A", don't skip it silently.
-0. Environment
+# Field Log — Phase 3 Hardware Verification (Extractor + Matcher)
 
-bash
+Same rules as before: fill in every field with actual command output, not
+a prose summary. Phase 3 has NOT been tested on real hardware at all yet
+— this is the first pass. Write "N/A" rather than skip a field silently.
 
-python3 -c "import cv2, numpy, gtsam; print('opencv', cv2.__version__); print('numpy', numpy.__version__); print('gtsam OK')"pip show opencv-python opencv-contrib-python 2>&1 | grep -E "^Name|^Version"
-Paste output:
+---
 
+## 0. Environment
 
+```bash
+python3 -c "import cv2, gtsam; print('opencv', cv2.__version__)"
+grep -c "BUGFIX\|Bug 1\|Bug 2\|Bug 3" extractor.py matcher.py vocabulary.py
+python3 -c "from config import DEFAULT_CONFIG as c; print('backend:', c['bundle_adjust']['backend'])"
+```
+**Paste output:**
+```
 [paste here]
+```
+**Backend confirmed as `gtsam`?** [ ] Yes  [ ] No (explain if No)
 
-gtsam installed successfully?  [ ] Yes  [ ] No — if No, paste the exact pip install gtsam error.
-1. Pre-flight — files landed correctly
+---
 
-bash
+## 1. Synthetic gates (no camera needed)
 
-grep -c "BUGFIX" initializer.py map_point.py local_mapping.py bundle_adjust_gtsam.py
-Paste output (expect nonzero counts on all 4):
-
-
+```bash
+python3 test_phase1_gate.py 2>&1 | tail -10
+python3 test_phase2_gate.py 2>&1 | tail -10
+python3 test_phase3_gate.py 2>&1 | tail -20
+```
+**Paste ALL THREE full tail outputs, plus how long the whole thing took:**
+```
 [paste here]
+```
+Time taken (all three combined): _______ (expect roughly 1-2 minutes; if
+it's much longer, stop here and send just this section — see
+RUNBOOK_PHASE3.md §4.4/4.5 before going further)
 
-2. Synthetic gates (no camera needed)
+---
 
-bash
+## 2. Visual spatial-distribution check
 
-python3 test_phase1_gate.py 2>&1 | tail -15python3 test_phase2_gate.py 2>&1 | tail -20
-Paste BOTH full tail outputs:
-
-
-[paste here]
-
-If either says anything other than ALL GATES PASSED, stop here and send
-me just this section — don't proceed to hardware tests on top of an
-environment where the baseline itself doesn't reproduce.
-3. Config used for the hardware run
-
-bash
-
-python3 -c "from config import DEFAULT_CONFIG as c; print('backend:', c['bundle_adjust']['backend']); print('keyframe_min_displacement:', c['tracking']['keyframe_min_displacement'])"
-(adjust the import if your config variable name differs)
-Paste output:
-
-
-[paste here]
-
-Which backend did you actually run with?  [ ] scipy  [ ] gtsam
-4. Stationary test (camera still, ~10s, no motion)
-Command run:
-
-
-[paste your exact command, e.g. python3 run_slam.py --realsense --seconds 10]
-
-Final summary block from the run (frames processed, tracking
-successes/losses, keyframes, path length, net displacement — whatever
-your run prints at the end):
-
-
-[paste here]
-
-map_health() output — add this right after the run finishes, before
-the process exits:
-
-python
-
-import metricsprint(metrics.map_health(slam))
-
-[paste the dict here]
-
-5. Short straight-line motion test (~1m, no rotation)
-Command run:
-
-
-[paste here]
-
-Final summary + map_health() dict:
-
-
-[paste here]
-
-Last 15 [TRACK] lines before the run ended (or before any tracking
-loss, if one occurred):
-
-
-[paste here]
-
-6. The original 30cm-forward/turn/30cm-back loop test
-This is the one that originally produced 4–21 Atlas maps and zero loop
-closures — the direct comparison point.
-Command run:
-
-
-[paste here]
-
-Final summary block:
-
-
-[paste here]
-
-map_health() dict — this is the single most important field in this
-whole document:
-
-
-[paste here]
-
-If more than 1 Atlas map was created, the last 15 [TRACK] lines
-immediately before EACH map-split event (copy this block once per
-split):
-
-
---- split event 1 ---
-[paste here]
-
---- split event 2 (if any) ---
-[paste here]
-[BA] log line samples — 3-4 representative lines from throughout the
-run, so I can see the free/fixed/points/obs numbers and which backend
-actually fired:
-
-
-[paste here]
-
-7. Self-check before sending (tick what applies)
-Cross-reference against RUNBOOK.md §4 before flagging something as a
-new bug — saves a round-trip if it's actually an already-documented,
-expected limitation:
-
- Loop closures = 0 — expected until Phase 5, not a bug on its own (RUNBOOK §4.1)
- IMU never initializes — expected until Phase 7, not a bug on its own (RUNBOOK §4.2)
- More than 1 Atlas map — check whether the pre-split [TRACK] lines show gradual or sudden inlier collapse (RUNBOOK §4.3, §4.7) before flagging
- Low max_observations — check your keyframe_min_displacement against walking speed first (RUNBOOK §4.4)
- [BA] lines show backend=scipy even though config says gtsam — means the fallback fired; paste the [BA] config requested gtsam... warning line if present
-8. Anything else you noticed
-Free text — crashes, weird behavior, anything that doesn't fit a field
-above:
-
-Phase 2 Runbook — GTSAM Bundle Adjustment
-Companion to RUNBOOK.md (Phase 0/1). Read that one first if you haven't
-— this one assumes the Phase 1 culling fix is already in place and adds
-what's specific to the GTSAM backend swap.
-1. What changed, in one paragraph
-bundle_adjust.py's scipy-based local BA is now optionally replaced bybundle_adjust_gtsam.py, selected via config["bundle_adjust"]["backend"] = "gtsam". Three real bugs were found and fixed while verifying it, all
-via the same "run it against synthetic ground truth, don't trust that low
-cost means correct" discipline as Phase 1: a variable-consistency crash
-(factor referencing a keyframe never inserted into the graph), a silent
-wrong-answer bug (plain 2D reprojection factors threw away RGB-D's actual
-depth measurement, reintroducing monocular scale ambiguity), and a second,
-different-root-cause crash with the identical error message (an isolated
-graph node from a freshly-created keyframe with no mature points yet).
-2. Architecture map
-┌─────────────────────────────────────────────────────────────┐
-│  UNCHANGED FROM PHASE 1                                       │
-│    Everything in RUNBOOK.md's architecture map still applies. │
-├─────────────────────────────────────────────────────────────┤
-│  NEW THIS PHASE                                                │
-│    bundle_adjust_gtsam.py  — GTSAM local BA, virtual-stereo   │
-│                              depth factors, config-selectable  │
-│    config["bundle_adjust"]["backend"]  — "scipy" | "gtsam"    │
-│    run_slam.py                        — backend switch + a    │
-│                              safety fallback if gtsam missing  │
-├─────────────────────────────────────────────────────────────┤
-│  STILL NOT DONE — same gaps as before, unaffected by Phase 2  │
-│    pose_graph.py → GTSAM        (Phase 6, needs loop closing) │
-│    IMU factors → GTSAM          (Phase 7, needs IMU wiring)   │
-│    Loop closing, real BoW, extractor rework, dense fallback   │
-│    — see RUNBOOK.md, none of this changed                     │
-└─────────────────────────────────────────────────────────────┘
-3. Pre-flight checklist, Phase-2-specific
-3.1 — Confirm gtsam actually installed, not just attempted.
-
-python3 -c "import gtsam; print(gtsam.__file__)"
-gtsam's Python bindings are a compiled wheel with real binary
-dependencies (Eigen, Boost in some builds). A pip install gtsam that
-appears to succeed but was actually served from a cache or partial
-download can produce confusing ImportErrors only when a specific
-submodule is touched (e.g. gtsam.noiseModel.mEstimator), not at the top-
-level import gtsam. Test the actual symbols this code uses:
-
-python3 -c "
-import gtsam
-from gtsam import Cal3_S2Stereo, StereoPoint2, GenericStereoFactor3D, GenericProjectionFactorCal3_S2
-from gtsam.symbol_shorthand import X, L
-print('all required symbols present')
-"
-3.2 — Confirm the fallback path works, deliberately.
-Before trusting the "gtsam" backend, deliberately break it to confirmrun_slam.py degrades safely instead of silently doing nothing:
-
-python3 -c "
-import sys
-sys.modules['bundle_adjust_gtsam'] = None  # simulate gtsam not installed
-" 
-Actually easier: just check the fallback log line appears when you setbackend: "gtsam" in an environment without gtsam installed — you should
-see [BA] config requested gtsam backend but gtsam is not installed -- falling back to scipy, NOT silence. If you see silence and BA simply
-never runs, something regressed — that would be worse than either backend
-alone, since it means keyframes accumulate with zero optimization.
-3.3 — Run both gates together before hardware, not just Phase 2's.
-
-python3 test_phase1_gate.py && python3 test_phase2_gate.py
-Both must pass. Phase 2 was verified not to regress Phase 1 in my
-environment; confirm the same holds in yours before layering a hardware
-test on top of both.
-4. Symptom → diagnosis → fix (GTSAM-specific)
-4.1 — ImportError or ModuleNotFoundError: No module named 'gtsam'
-Not a code bug. Either pip install gtsam wasn't run, or it silently
-failed (check pip list | grep -i gtsam). If you don't want to debug a
-gtsam install right now, set backend: "scipy" in config and proceed —
-Phase 1's fixes are backend-independent, you don't need GTSAM working to
-test Phase 1's map-lifecycle fix on hardware.
-
-4.2 — RuntimeError: An inference algorithm was called with inconsistent arguments
-This exact message covers two different root causes in this codebase
-(see bundle_adjust_gtsam.py's docstring, Bugs 1 and 3) — both were found
-and fixed, but if you see this message again on real hardware data, it
-means a THIRD variant of the same class of bug exists that the synthetic
-tests didn't reproduce. Useful things to capture before reporting:
-
-# right before the crash, dump exactly what's inconsistent:
-print("free kfs:", [kf.id for kf in free_kfs])
-print("fixed kfs:", [kf.id for kf in fixed_kfs])
-print("points:", len(points), "total observations touched:", n_obs)
-Real sensor data has messier edge cases than synthetic sequences —
-duplicate keyframe insertion during a race between tracking and local
-mapping, a map point erased mid-BA-call, etc. If this fires, it's a real
-finding, not noise — send me the three print lines above plus the
-surrounding [TRACK]/[RGBD] log context.
-
-4.3 — [BA-GTSAM] cost goes to ~0 but the trajectory looks visibly wrong
-This is exactly Bug 2 from Phase 2's own verification — the gauge/scale
-ambiguity signature. It should be structurally prevented now (every BA
-call either has a real fixed anchor or the explicit fallback prior), but
-if you see a suspiciously perfect cost alongside an implausible trajectory
-jump, check:
-
-[BA-GTSAM] N free + M fixed kfs, ...
-If M fixed kfs = 0 on a call where the map clearly has more keyframes
-than the window, that's the bug resurfacing — the fixed-keyframe detection
-logic didn't find an anchor when one should exist. Report the map size at
-that point (n_keyframes_alive from metrics.map_health()) alongside the
-window setting.
-
-4.4 — GTSAM backend is noticeably slower than scipy, not faster
-Expected in small-map regimes, not a regression. Phase 2's own
-measurement: on a healthy, properly-culled 60-frame map (Phase 1 working
-as intended), a single GTSAM BA call took ~75-80ms, comparable to scipy's
-baseline — GTSAM's real advantage (marginalizing landmarks so cost scales
-with pose count, not pose+landmark count) shows up as the number of FIXED
-keyframes grows, which is exactly the scenario Phase 1's culling fix is
-designed to prevent from happening uncontrolled. In other words: if
-Phase 1 is working, you may not see a dramatic GTSAM speed advantage on
-short test clips, and that's consistent with everything measured so far,
-not a sign something's wrong. The comparison that WOULD show a difference
-needs a much longer, more keyframe-dense recording than a 10-30s D435i
-clip — not worth engineering a hardware test around Phase 2 alone.
-
-4.5 — Poses "jump" specifically at the moment BA switches between scipy and gtsam mid-run
-Should not happen — the backend is selected once at SLAMSystem
-construction from config, not per-call. If you see this, check you're not
-accidentally constructing two different SLAMSystem instances (e.g., one
-for a warm-up pass, one for the real run) with different configs loaded.
-
-4.6 — Points visibly drift or the map looks warped after a GTSAM BA call, but no crash and no gates fail
-The synthetic gates test bounded, well-behaved input. Real sensor depth
-noise is heavier-tailed (holes, flying pixels at depth discontinuities,
-occasional gross outliers near object edges). The Huber robust kernel
-(huber_f_scale in config) is meant to down-weight these, but if a
-specific keyframe has an unusually high fraction of bad depth (e.g.
-pointed at a reflective/transparent surface), even Huber can't fully
-compensate. This is a real, expected RGB-D limitation, not a GTSAM
-integration bug — but if it's happening frequently, it's worth logging
-which observations are stereo-factor vs mono-fallback (n_obs_stereo vsn_obs - n_obs_stereo in the [BA-GTSAM] line) since a high mono-
-fallback fraction means a lot of points are being optimized WITHOUT the
-depth constraint that fixes Bug 2 — i.e., check whether your D435i's
-depth-valid fraction on the affected keyframes is unusually low.
-5. Testing order
-Same order as RUNBOOK.md §5 (stationary → straight-line → loop test →
-facility walkthrough), run TWICE at each step: once with backend: "scipy", once with backend: "gtsam". You're not looking for GTSAM to
-be dramatically better on a short clip (see §4.4) — you're looking for it
-to be at least as good and not crash, which is the actual claim this
-phase makes. A real, measurable GTSAM advantage will show up once Phase 6
-(pose-graph/loop-closure optimization) and longer recordings are in play.
-
-6. What "success" looks like for this phase
-Both backends produce map-health numbers in the same order of
-magnitude on the same recording (neither one should look broken
-relative to the other).
-No inconsistent arguments crashes on real hardware data.
-[BA-GTSAM] lines show a real fixed-keyframe count once the map
-exceeds the window size (confirms the anchor logic is working on real,
-not just synthetic, data).
-Fill out FIELD_LOG.md with both backends and send it back — that's
-the actual gate for moving to Phase 3.      # Phase 0 + Phase 1 — completed and verified
-
-## Note on hardware verification status (added after real-D435i test)
-
-A real-hardware test was reported (Atlas fragmentation 21→2 maps, non-zero
-point fusion, displacement matching physical motion) but the report did
-not include the map-health obs-count histogram that this phase's gates
-are actually built around — see §"Verification" below for why that
-specific number matters more than created/culled/fused counts alone. The
-positive signals reported (map count, fusion, displacement) are real and
-consistent with the fix working; Phase 2 proceeded on that basis rather
-than blocking on it, since Phase 2 (the optimizer swap) doesn't depend on
-Phase 1's exact real-hardware numbers. This is flagged as **provisional**,
-not closed, until the histogram is checked. Two-line check, run whenever
-a terminal is available, right after your real test:
+Save one frame from the camera pointed at a normal indoor scene (some
+texture, some plainer surfaces — not a lab test pattern), run the
+extractor on it, and draw the keypoints:
 
 ```python
+import cv2
+from extractor import Extractor
+img = cv2.imread("your_saved_frame.png", cv2.IMREAD_GRAYSCALE)
+ex = Extractor()
+kps, descs = ex.extract(img)
+out = cv2.drawKeypoints(img, kps, None, color=(0,255,0))
+cv2.imwrite("keypoints_overlay.png", out)
+print(f"{len(kps)} keypoints")
+```
+
+**Keypoint count:** _______
+**Attach or describe `keypoints_overlay.png`:** does it look spread
+across the frame, or still concentrated in one region?
+```
+[describe or note the attached image here]
+```
+
+---
+
+## 3. Per-frame extraction timing
+
+```python
+import time
+t0 = time.time()
+kps, descs = ex.extract(img)
+print(f"{time.time()-t0:.3f}s for {len(kps)} keypoints")
+```
+**Paste output (run 3-4 times on different frames):**
+```
+[paste here]
+```
+
+---
+
+## 4. Live D435i run — stationary (~10s, no motion)
+
+Command run:
+```
+[paste here]
+```
+**Final summary block:**
+```
+[paste here]
+```
+**map_health() dict:**
+```python
 import metrics
-print(metrics.map_health(slam))   # `slam` = your SLAMSystem instance
+print(metrics.map_health(slam))
+```
+```
+[paste here]
+```
+
+---
+
+## 5. Live D435i run — the 30cm-forward/turn/30cm-back loop test
+
+Command run:
+```
+[paste here]
+```
+**Final summary block:**
+```
+[paste here]
+```
+**map_health() dict:**
+```
+[paste here]
+```
+**Backend actually used for this run** (check `slam.cfg["bundle_adjust"]["backend"]`
+right before or during the run): _______
+
+**Sample of 5-10 `[TRACK]` lines from partway through the run** (not the
+very start — pick a stretch after a few keyframes have formed):
+```
+[paste here]
+```
+
+**Any multi-second pauses observed during the run?** [ ] Yes [ ] No
+If yes, roughly how long and at what point (frame number / keyframe count if known):
+```
+[paste here]
+```
+
+---
+
+## 6. Comparison note
+
+If you have a Phase 1 or Phase 2 field log from the SAME physical test
+setup (same room, same motion), roughly how does this run's map_health()
+compare? (more keyframes alive, more/fewer points at ≥4 observations,
+etc. — doesn't need to be precise, just a sanity comparison)
+```
+[paste here]
+```
+
+---
+
+## 7. Self-check before sending
+
+- [ ] Extraction time per frame is in the 100-300ms range, not several seconds (§RUNBOOK_PHASE3 4.1)
+- [ ] No multi-minute pauses in the synthetic gate suite (§4.4/4.5)
+- [ ] Backend confirmed as `gtsam` for the live run, not accidentally `scipy`
+- [ ] Keypoints visually spread across the frame, not concentrated in one corner
+- [ ] Cross-referenced RUNBOOK.md's existing known-expected items (loop closures=0, IMU not initializing) before flagging them as new
+
+---
+
+## 8. Anything else noticed
+
+```
+[paste here]
+```
+
+
+
+
+
+
+# Phase 3 Runbook — Extractor & Matcher Rewrite
+
+Companion to `RUNBOOK.md` (Phase 0/1) and `RUNBOOK_PHASE2.md` (GTSAM).
+Assumes both are already in place. This one is unusual: half the real
+bugs it found weren't in the extractor or matcher at all — read §4
+carefully, especially 4.4-4.6, before assuming a symptom is extractor-
+related just because this was "the extractor phase."
+
+---
+
+## 1. What changed, in one paragraph
+
+`extractor.py` went from a bare `cv2.ORB_create()` call to per-level grid
+FAST detection with an adaptive-threshold fallback and grid-based spatial
+distribution, with descriptors computed via a patch-based
+`detectAndCompute()` call (required for correct rotation invariance —
+OpenCV's `.compute()` silently skips it on manually-built keypoints).
+`matcher.py` gained a rotation-consistency histogram, wired into
+`initializer.py`'s two-view matching (not `tracking.py`'s `_solve_pnp`,
+where it doesn't apply). Along the way, two unrelated but serious bugs
+were found and fixed: `vocabulary.py`'s KMeans placeholder took 133
+seconds in one call once fed richer real data, and `config.py`'s BA
+backend was still defaulting to `scipy`, which Phase 3's richer maps push
+into a multi-second-per-call regime even under normal operation.
+
+---
+
+## 2. Architecture map
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  UNCHANGED FROM PHASE 1/2                                      │
+│    Everything in RUNBOOK.md and RUNBOOK_PHASE2.md still applies │
+├─────────────────────────────────────────────────────────────┤
+│  NEW THIS PHASE                                                 │
+│    extractor.py     — full rewrite, see PROJECT_SUMMARY.md §7  │
+│    matcher.py        — rotation_consistency_filter() added      │
+│    tracking.py        — _solve_pnp uses match_ratio() now        │
+│    initializer.py      — init_monocular uses ratio+rotation now   │
+├─────────────────────────────────────────────────────────────┤
+│  FIXED IN PASSING (found because of Phase 3, not Phase 3 itself)│
+│    vocabulary.py     — KMeans sample cap + n_words clamp        │
+│    config.py          — bundle_adjust default backend -> gtsam   │
+│    synthetic.py        — texture generator rewritten (test-only)  │
+├─────────────────────────────────────────────────────────────┤
+│  STILL NOT DONE — unaffected by Phase 3                        │
+│    Dense RGB-D fallback, real BoW, loop closing, IMU wiring      │
+│    — see RUNBOOK.md / PROJECT_SUMMARY.md                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Pre-flight checklist
+
+**3.1 — Confirm the files landed.**
+```bash
+grep -c "BUGFIX\|Bug 1\|Bug 2\|Bug 3" extractor.py matcher.py vocabulary.py
+```
+Expect nonzero on all three.
+
+**3.2 — Confirm the default backend actually changed.**
+```bash
+python3 -c "from config import DEFAULT_CONFIG as c; print(c['bundle_adjust']['backend'])"
+```
+Should print `gtsam`, not `scipy`. If your local config was hand-edited
+after Phase 2, this diff may not have applied cleanly — check manually.
+
+**3.3 — Run the full three-phase gate before touching hardware.**
+```bash
+python3 test_phase1_gate.py && python3 test_phase2_gate.py && python3 test_phase3_gate.py
+```
+All three should pass, and the *whole set* should complete in roughly a
+minute or two. If any of them takes several minutes or hangs, don't
+proceed to hardware — see §4.4/4.5 below, that exact symptom has a known
+cause and a known fix already applied; if it recurs, something didn't
+land correctly.
+
+**3.4 — Expect a printed warning, not silence.**
+```
+[vocabulary] WARNING: n_words=10000 requested, but this is the KMeans PLACEHOLDER...
+```
+This is supposed to print once loop closing's config is read. Its
+absence would be more suspicious than its presence — it means the clamp
+isn't running.
+
+---
+
+## 4. Symptom → diagnosis → fix
+
+### 4.1 — Extraction feels slow per frame
+
+**Expected, bounded, not a regression on its own.** The new extractor
+does real per-cell FAST detection and per-keypoint patch-based
+description instead of one bare OpenCV call. Measured in this project's
+environment: ~150-250ms per 640x480 frame (vs. a few ms for the old bare
+call). This is fine for offline processing but will feel very different
+from before if you're used to near-instant extraction. What's NOT
+expected is minutes per frame — if you see that, it's almost certainly
+§4.4 (wrong BA backend), not the extractor itself. Isolate before
+assuming:
+```python
+import time
+t0 = time.time(); kps, descs = extractor.extract(image); print(time.time()-t0)
+```
+
+### 4.2 — Rotation invariance regression (matches degrade badly under camera rotation)
+
+This is the single easiest thing to accidentally break if anyone touches
+`extractor.py`'s `_describe_keypoints()`. The specific failure mode: if
+someone "simplifies" it back to calling `.compute()` on the pre-selected
+keypoints directly (instead of re-running `detectAndCompute()` on a
+patch), rotation invariance silently disappears — OpenCV does not error,
+it just returns descriptors with no real orientation compensation.
+`test_phase3_gate.py`'s Test 3 exists specifically to catch this; run it
+after any extractor edit:
+```bash
+python3 -c "import test_phase3_gate as t; t.test_rotation_invariance()"
+```
+Expect mean Hamming distance well under 110/256 (random baseline ~128).
+If it creeps back up toward 120+, this is the regression.
+
+### 4.3 — Keypoints look substituted / jump to a nearby-but-wrong location
+
+Check `self._orb_describe`'s `nfeatures` parameter in `extractor.py`'s
+`__init__`. It must be a reasonably large number (currently 30), not 1 —
+with `nfeatures=1`, the patch-describe step returns only the single
+globally-strongest corner anywhere in the patch, which is frequently NOT
+the intended location. This was a real bug found and fixed during Phase
+3; if it recurs, the rotation-invariance test in §4.2 will also degrade,
+since both symptoms share the same root cause.
+
+### 4.4 — Everything is dramatically slower than expected; a single BA call takes seconds
+
+**Check the backend first, before touching anything else:**
+```python
+print(slam.cfg["bundle_adjust"]["backend"])
+```
+If this says `scipy`, that's very likely the entire problem. Phase 3's
+richer, better-distributed keypoints mean more valid points/observations
+per keyframe than before — enough on its own to push scipy's solver to
+multi-second-per-call territory even under completely normal (non-
+pathological) operation, which is why the default was changed to
+`gtsam`. If you've overridden config and are intentionally testing
+scipy, this slowness is expected and documented, not a bug. If you
+didn't override it and it still says `scipy`, the config change didn't
+apply — check `config.py` directly.
+
+### 4.5 — The pipeline hangs for ~2 minutes then continues (not a permanent hang, but a very long pause)
+
+This is very likely `vocabulary.py`'s `build()` being called with far
+more clusters than its sample cap safely supports. Check for the
+warning from §3.4 — if it's ABSENT and you still see a long pause right
+around when keyframe count crosses ~20 (the loop-closing gate), the
+`n_words` clamp in `Vocabulary.__init__` may not be applying. Confirm:
+```python
+print(vocab.n_words)  # should be <=256 regardless of config's requested value
+```
+
+### 4.6 — A previously-passing map-health gate now fails after a synthetic-test-only change
+
+If you ever modify `synthetic.py`'s texture generator again, re-run the
+full gate suite before trusting any other change — Phase 3's own history
+is a direct warning here. The texture went through THREE iterations
+(blurred noise → circles+lines → rectangles+lines) because each fixed one
+real problem while silently introducing another (self-similarity broke
+the ratio test; smooth circle boundaries broke corner localization
+precision). A synthetic texture is not a neutral choice once your test
+exercises anything beyond basic bookkeeping — it interacts with real
+algorithmic behavior (ratio-test ambiguity rejection, sub-pixel corner
+precision) in ways that are easy to miss if you only look at one metric
+at a time.
+
+### 4.7 — Map-health numbers on real hardware look different from the synthetic gate's numbers
+
+Expected, within reason — this hasn't been tested on real hardware AT
+ALL yet for Phase 3 (see PROJECT_SUMMARY.md §7). Real depth noise, real
+lighting, and real scene structure (not rectangles and circles) will all
+shift the exact numbers. What should NOT differ qualitatively: rotation
+invariance should still clearly beat random matching, keypoints should
+still appear across more of the image than a single concentrated region,
+and a genuinely blank wall segment should still yield very few
+keypoints — this is physics, not a bug (see RUNBOOK.md §4.4 and this
+runbook's own texture-related notes above).
+
+---
+
+## 5. Testing order
+
+1. Full synthetic gate suite (§3.3) — must pass before anything else.
+2. Point the camera at a mix of textured and low-texture surfaces (a
+  wall with SOME structure — a light switch, a door frame, a sign — not
+  a perfectly blank painted wall, which no detector can help). Confirm
+  keypoints appear across more of the frame than they did before Phase 3,
+  not just concentrated in one corner.
+3. A deliberate rotation test (similar to earlier D435i loop tests).
+  Watch for the frame-145-style collapse signature specifically — it
+  should be reduced, though this hasn't been confirmed on real hardware.
+4. Fill out a field log (see the companion `FIELD_LOG_PHASE3.md`) and
+  send it back before treating Phase 3 as hardware-confirmed.
+
+## 6. What "success" looks like for this phase
+
+1. `test_phase1_gate.py`, `test_phase2_gate.py`, `test_phase3_gate.py`
+  all pass, in well under 2 minutes combined, on your machine.
+2. On real footage: keypoints visibly spread across more of the frame
+  than before (can be checked by drawing keypoints on a saved frame and
+  looking at it — `cv2.drawKeypoints`).
+3. No multi-second pauses during normal operation (confirms both the
+  vocabulary fix and the backend-default fix landed correctly).
+4. Map-health numbers (obs≥4, max observations) on real hardware are the
+  same order of magnitude as the synthetic gate's — not necessarily
+  identical, real data is messier, but not wildly different either.
