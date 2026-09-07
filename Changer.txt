@@ -6675,6 +6675,1599 @@ against loop closing.
 
 
 
+"""
+frame.py — everything known about ONE photo.
+
+Maps to: ORB_SLAM3/src/Frame.cc (the monocular + RGB-D constructors)
+  ExtractORB           -> runs the extractor in __init__
+  UndistortKeyPoints   -> undistorted keypoint coords (was MISSING before, now fixed)
+  mvpMapPoints         -> map_point_ids
+  SetPose / GetPose    -> pose
+
+RGB-D: if a depth image is supplied, each keypoint also gets a depth value,
+which lets us unproject straight to 3D with NO triangulation needed.
+
+SIMPLIFICATIONS: no grid index for fast area lookup (AssignFeaturesToGrid),
+no isInFrustum visibility test, no BoW vector stored per frame.
+"""
+
+import numpy as np
+import cv2
+
+
+class Frame:
+    _next_id = 0
+
+    def __init__(self, image, timestamp, camera, extractor, depth_image=None,
+                keep_dense=False):
+        self.id = Frame._next_id
+        Frame._next_id += 1
+
+        self.timestamp = timestamp
+        self.camera = camera
+        self.image_shape = None if image is None else image.shape[:2]
+
+        # Phase 4: optionally retain the FULL grayscale image and a
+        # full-resolution depth-in-metres map, not just per-keypoint
+        # values -- needed for dense_odometry.py's fallback, which uses
+        # whole-image photometric+geometric gradients rather than sparse
+        # corners. NOT retained by default: self.frames in run_slam.py
+        # keeps every Frame object forever (for trajectory export), so
+        # unconditionally storing ~1.5MB/frame here would leak memory
+        # across a long facility walk. run_slam.py explicitly clears
+        # this after the keyframe-insertion decision unless the frame
+        # actually becomes a keyframe -- see that file's process().
+        self.gray_image = None
+        self.depth_m = None
+        if keep_dense and image is not None:
+            self.gray_image = (cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                               if len(image.shape) == 3 else image.copy())
+            if depth_image is not None:
+                import dense_odometry
+                self.depth_m = dense_odometry.depth_image_to_meters(depth_image, camera)
+
+        # ORB extraction — Frame.cc calls this inside its constructor too
+        self.keypoints, self.descriptors = extractor.extract(image)
+        self.n = len(self.keypoints)
+
+        # Undistorted pixel coordinates (Frame::UndistortKeyPoints)
+        if self.n > 0 and camera.has_distortion():
+            raw = np.float32([kp.pt for kp in self.keypoints])
+            self.points_undistorted = camera.undistort_points(raw)
+        elif self.n > 0:
+            self.points_undistorted = np.float32([kp.pt for kp in self.keypoints])
+        else:
+            self.points_undistorted = np.zeros((0, 2), np.float32)
+
+        # RGB-D: depth per keypoint, in metres. -1 where invalid.
+        self.depths = np.full(self.n, -1.0, dtype=np.float64)
+        if depth_image is not None and self.n > 0:
+            self._fill_depths(depth_image, camera)
+
+        # map_point_ids[i] = id of the MapPoint that keypoints[i] matches, or None
+        self.map_point_ids = [None] * self.n
+        self.outliers = [False] * self.n
+
+        # Frame::AssignFeaturesToGrid() — bucket keypoints into a coarse
+        # grid so "find keypoints near pixel (x,y)" is O(few) instead of
+        # O(n). Needed for guided matching (covisibility.py's local-map
+        # tracking, fusion.py's SearchInNeighbors) instead of brute-forcing
+        # every descriptor in the map against every frame descriptor.
+        self.grid_cols = 64
+        self.grid_rows = 48
+        self._grid = None   # built lazily by get_features_in_area()
+
+        self.pose = None          # 4x4 camera-to-world. None until estimated.
+        self.is_keyframe = False
+        # Sequential keyframe index, assigned by Map.add_keyframe(). None
+        # until this frame actually becomes a keyframe. Distinct from `id`
+        # (which counts EVERY frame processed) on purpose -- see map.py.
+        self.kf_seq = None
+
+        # Visual-inertial state (Phase 3/4). velocity is in the same frame
+        # as pose (camera frame at capture time, expressed in world axes --
+        # i.e. d(camera_center)/dt). bias_* carried forward from the last
+        # inertial BA / initialization (see imu_init.py, bundle_adjust.py).
+        # imu_preint links this keyframe to the PREVIOUS keyframe via a
+        # imu.Preintegration spanning that interval; None until it becomes
+        # a keyframe (see run_slam.py).
+        self.velocity = None
+        self.bias_gyro = np.zeros(3)
+        self.bias_accel = np.zeros(3)
+        self.imu_preint = None
+
+    def _build_grid(self):
+        h, w = self.image_shape if self.image_shape else (480, 640)
+        self._cell_w = max(w / self.grid_cols, 1e-6)
+        self._cell_h = max(h / self.grid_rows, 1e-6)
+        grid = [[[] for _ in range(self.grid_rows)] for _ in range(self.grid_cols)]
+        for i in range(self.n):
+            x, y = self.points_undistorted[i]
+            gx = int(x / self._cell_w)
+            gy = int(y / self._cell_h)
+            if 0 <= gx < self.grid_cols and 0 <= gy < self.grid_rows:
+                grid[gx][gy].append(i)
+        self._grid = grid
+
+    def get_features_in_area(self, x, y, radius, min_level=-1, max_level=-1):
+        """
+        Frame::GetFeaturesInArea(): keypoint indices within `radius` pixels
+        of (x, y), optionally restricted to a pyramid octave range. Backed
+        by the grid so this stays cheap regardless of how many keypoints
+        the frame has.
+        """
+        if self._grid is None:
+            self._build_grid()
+        if self.n == 0:
+            return []
+
+        gx_min = max(0, int((x - radius) / self._cell_w))
+        gx_max = min(self.grid_cols - 1, int((x + radius) / self._cell_w))
+        gy_min = max(0, int((y - radius) / self._cell_h))
+        gy_max = min(self.grid_rows - 1, int((y + radius) / self._cell_h))
+        if gx_min > gx_max or gy_min > gy_max:
+            return []
+
+        result = []
+        r2 = radius * radius
+        for gx in range(gx_min, gx_max + 1):
+            for gy in range(gy_min, gy_max + 1):
+                for i in self._grid[gx][gy]:
+                    if min_level >= 0 and self.keypoints[i].octave < min_level:
+                        continue
+                    if max_level >= 0 and self.keypoints[i].octave > max_level:
+                        continue
+                    px, py = self.points_undistorted[i]
+                    if (px - x) ** 2 + (py - y) ** 2 <= r2:
+                        result.append(i)
+        return result
+
+    def _fill_depths(self, depth_image, camera):
+        h, w = depth_image.shape[:2]
+        scale = camera.depth_scale if camera.depth_scale else 0.001
+        for i, kp in enumerate(self.keypoints):
+            u, v = int(round(kp.pt[0])), int(round(kp.pt[1]))
+            if 0 <= u < w and 0 <= v < h:
+                raw = float(depth_image[v, u])
+                if raw > 0:
+                    self.depths[i] = raw * scale
+
+    # ── pose helpers ─────────────────────────────────────────────────────
+
+    def set_pose(self, pose_4x4):
+        self.pose = np.asarray(pose_4x4, dtype=np.float64).reshape(4, 4)
+
+    def camera_center(self):
+        """Position of the camera in world coordinates."""
+        return None if self.pose is None else self.pose[:3, 3].copy()
+
+    def rotation(self):
+        return None if self.pose is None else self.pose[:3, :3].copy()
+
+    # ── RGB-D unprojection ───────────────────────────────────────────────
+
+    def unproject_keypoint(self, idx):
+        """
+        Keypoint index -> 3D point in WORLD coordinates, using its depth.
+        Returns None if depth invalid or pose unknown.
+
+        This is Frame::UnprojectStereo() — the RGB-D shortcut that skips
+        triangulation entirely. This is why depth cameras don't suffer the
+        parallax-starvation cold-start problem.
+        """
+        if self.pose is None:
+            return None
+        z = self.depths[idx]
+        if z <= 0:
+            return None
+        p_cam = self.camera.unproject(self.points_undistorted[idx], depth=z)
+        return self.pose[:3, :3] @ p_cam + self.pose[:3, 3]
+
+    def n_tracked_points(self):
+        return sum(1 for x in self.map_point_ids if x is not None)
+
+    def n_valid_depths(self):
+        return int(np.count_nonzero(self.depths > 0))
+
+    def __repr__(self):
+        return (f"Frame(id={self.id}, t={self.timestamp:.3f}, kps={self.n}, "
+                f"tracked={self.n_tracked_points()}, kf={self.is_keyframe}, "
+                f"posed={self.pose is not None})")
+
+
+
+
+
+"""
+config.py — one YAML file for every tunable that used to be a hardcoded
+default scattered across camera.py, tracking.py, local_mapping.py, and
+bundle_adjust.py. Doesn't change any behavior by itself (defaults below
+match what the code already used) -- it's here so that per-facility tuning
+(texture, room scale, how aggressive to gate depth) doesn't require editing
+source files, and so record.py / run_dataset.py can share one source of
+truth for capture and replay settings.
+
+Usage:
+    from config import load_config
+    cfg = load_config("config.yaml")   # or load_config() for defaults
+    extractor = Extractor(**cfg["extractor"])
+    tracking = Tracking(camera, extractor, matcher, world_map, **cfg["tracking"])
+    local_mapping = LocalMapping(camera, matcher, world_map, **cfg["local_mapping"])
+"""
+
+import copy
+import os
+import yaml
+
+DEFAULTS = {
+    "capture": {
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "use_ir": False,          # track on left IR instead of RGB -- see camera.py
+        "use_depth": True,
+        "enable_imu": False,      # set True once imu.py lands (Phase 3)
+        "accel_rate_hz": 250,
+        "gyro_rate_hz": 200,
+    },
+    "initializer": {
+        "rgbd_min_points": 100,
+        "mono_min_matches": 100,
+        "mono_min_parallax_px": 2.0,
+    },
+    "extractor": {
+        "nfeatures": 1200,
+        "scale_factor": 1.2,
+        "nlevels": 8,
+        "ini_th_fast": 20,
+        "min_th_fast": 7,
+    },
+    "tracking": {
+        "min_matches_for_pose": 15,
+        "keyframe_min_matches": 50,
+        "keyframe_min_displacement": 0.10,
+        "keyframe_max_frames": 20,
+        "use_dense_fallback": True,   # Phase 4 -- see dense_odometry.py
+        "dense_depth_trunc": 5.0,     # metres; matches D435i's practical range
+    },
+    "local_mapping": {
+        "min_parallax_px": 2.0,
+        "max_neighbors": 5,
+        "culling_found_ratio": 0.25,
+        "culling_min_obs": 3,
+        # ORB-SLAM3's RGB-D point-creation rule (see local_mapping.py):
+        "max_new_points_per_kf": 100,
+        "depth_min": 0.3,
+        "depth_max": 3.5,
+        "depth_patch_radius": 2,
+        "depth_rel_std_max": 0.02,
+    },
+    "bundle_adjust": {
+        # BUGFIX (found during Phase 3 verification): this defaulted to
+        # "scipy" through Phase 2. That was fine when it was still true
+        # that most BA calls stayed small -- but Phase 3's extractor
+        # rewrite gives every keyframe a genuinely richer, better-
+        # distributed set of valid points/observations (that's the whole
+        # point of the rewrite), which is enough on its own to push even
+        # NORMAL, properly-culled BA windows (21-22 keyframes, nothing
+        # pathological) into scipy's slow-scaling regime: measured at
+        # ~6.6s PER CALL, 125.9 of 133.5s total in one 30-frame profile.
+        # GTSAM completed the identical scenario in 5.74s total. Phase 2
+        # built exactly the fix this needs; it just wasn't the default.
+        "backend": "gtsam",  # "scipy" (original, now known to not scale
+                             # past Phase 3's richer maps) or "gtsam"
+        "window": 8,
+        "max_iter": 15,
+        "min_obs_to_optimize": 2,
+        "huber_f_scale": 2.0,
+    },
+    "loop_closing": {
+        "min_keyframe_gap": 30,
+        "vocab_words": 10000,      # Phase 5: NO LONGER USED -- ORBVocabulary
+                                   # loads a fixed, real ~971,814-word
+                                   # vocabulary from disk (see
+                                   # orb_vocabulary.py); this key is kept
+                                   # only so old configs don't error on
+                                   # load, not read by anything anymore.
+        "consistency_checks": 3,   # require same candidate over N consecutive KFs
+    },
+    "relocalization": {
+        "min_inliers": 20,
+        "top_n_candidates": 5,
+    },
+    "imu": {
+        # BMI085 datasheet fallbacks -- measured (record.py's static-camera
+        # calibration recording) is better, but these work to get running.
+        "noise_gyro": 1.7e-2,      # rad/s / sqrt(Hz)
+        "noise_accel": 2.0e-2,     # m/s^2 / sqrt(Hz)
+        "gravity_magnitude": 9.81,
+        "init_min_keyframes": 6,
+        "init_window_seconds": 2.0,
+        "observability_min_gyro_std": 0.05,
+        "observability_min_accel_std": 0.3,
+        "recently_lost_max_seconds": 2.0,   # IMU-only survival window (Phase 4)
+        "ba_window": 8,
+    },
+    "dataset": {
+        "images_dirname": "images",
+        "depth_dirname": "depth",
+        "imu_filename": "imu.csv",
+        "manifest_filename": "manifest.csv",
+    },
+}
+
+
+def load_config(path=None):
+    """
+    Returns a deep-merged dict: DEFAULTS overridden by whatever's in the
+    YAML file at `path` (only the keys present in the file are overridden;
+    everything else keeps its default). Returns DEFAULTS untouched if path
+    is None or doesn't exist.
+    """
+    cfg = copy.deepcopy(DEFAULTS)
+    if path and os.path.exists(path):
+        with open(path, "r") as f:
+            user_cfg = yaml.safe_load(f) or {}
+        for section, values in user_cfg.items():
+            if section in cfg and isinstance(values, dict):
+                cfg[section].update(values)
+            else:
+                cfg[section] = values
+    return cfg
+
+
+def save_default_config(path="config.yaml"):
+    """Write DEFAULTS to disk as a starting point for editing."""
+    with open(path, "w") as f:
+        yaml.safe_dump(DEFAULTS, f, sort_keys=False, default_flow_style=False)
+    return path
+
+
+if __name__ == "__main__":
+    import sys
+    out = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    save_default_config(out)
+    print(f"Wrote default config to {out}")
+
+
+
+
+"""
+run_slam.py — the orchestrator.
+
+Replaces: mono_video.cc + System.cc's thread launching.
+Real ORB-SLAM3 runs Tracking / LocalMapping / LoopClosing on three parallel
+threads. We run them sequentially in one loop — simpler to follow, and the
+result is identical for offline processing.
+
+Two input modes:
+  --realsense       live D435 (RGB-D, uses depth for instant init)
+  --frames <dir>    replay pre-extracted PNG frames (monocular)
+
+Usage:
+  python3 run_slam.py --realsense --seconds 30
+  python3 run_slam.py --frames ~/orb_scratch/IMG_1112 --calib calibration/x.json
+"""
+
+import argparse
+import glob
+import os
+import sys
+import time
+
+import cv2
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from camera import Camera
+from extractor import Extractor
+from matcher import Matcher
+from frame import Frame
+from atlas import Atlas
+from tracking import Tracking
+from local_mapping import LocalMapping
+from orb_vocabulary import ORBVocabulary
+from keyframe_database import KeyFrameDatabase
+import relocalization
+from loop_closing import LoopClosing
+import initializer
+from bundle_adjust import local_bundle_adjust, local_inertial_bundle_adjust, pose_only_optimize
+# Phase 2: GTSAM backend is optional -- only imported if config actually
+# requests it, so `gtsam` is not a hard dependency for anyone still on the
+# scipy backend. See bundle_adjust_gtsam.py's docstring for why this
+# exists and PROGRESS.md for the three bugs found verifying it.
+try:
+    from bundle_adjust_gtsam import local_bundle_adjust_gtsam
+except ImportError:
+    local_bundle_adjust_gtsam = None
+import imu
+import imu_init
+from config import load_config
+
+
+class SLAMSystem:
+    def __init__(self, camera, use_depth=False, verbose=True, use_imu=False, config_path=None):
+        self.camera = camera
+        self.use_depth = use_depth
+        self.verbose = verbose
+        self.use_imu = use_imu
+        self.cfg = load_config(config_path)
+
+        # BUGFIX: config.py was loaded (self.cfg) but every module below
+        # used to be constructed with hardcoded defaults instead of cfg's
+        # values -- e.g. cfg["loop_closing"]["vocab_words"]=10000 existed on
+        # disk but Vocabulary(n_words=64) below ignored it completely, and
+        # nothing in cfg["extractor"]/["tracking"]/["local_mapping"] had any
+        # effect at all. Wired through properly now so config.yaml edits
+        # actually change behavior. See PROGRESS.md.
+        self.extractor = Extractor(**self.cfg["extractor"])
+        self.matcher = Matcher()
+        self.atlas = Atlas()
+        self.tracking = Tracking(camera, self.extractor, self.matcher,
+                                 self.atlas.active_map, **self.cfg["tracking"])
+        self.local_mapping = LocalMapping(camera, self.matcher,
+                                          self.atlas.active_map,
+                                          extractor=self.extractor,
+                                          **self.cfg["local_mapping"])
+        # Shared covisibility graph: LocalMapping rebuilds this dict IN
+        # PLACE (see covisibility.py) after every keyframe, so Tracking
+        # always sees the latest version through this one reference.
+        self.tracking.covis_graph = self.local_mapping.covis_graph
+        # Phase 5: real ORBvoc-format vocabulary replaces the KMeans
+        # placeholder entirely -- see orb_vocabulary.py's module docstring
+        # for why, and setup_vocabulary.py for the one-time fetch script.
+        # Loading is NOT wrapped in a silent try/except: a facility-
+        # mapping run without a real vocabulary (BoW is an explicit hard
+        # requirement for this project) should fail loudly and tell the
+        # person exactly what to run, not silently degrade to something
+        # worse. If you deliberately want to run without it for a quick
+        # test, catch FileNotFoundError yourself around SLAMSystem(...).
+        self.vocab = ORBVocabulary()
+        self.vocab.load()
+        self.keyframe_db = KeyFrameDatabase(self.vocab)
+        self.loop_closer = LoopClosing(camera, self.matcher, self.vocab,
+                                       keyframe_db=self.keyframe_db,
+                                       min_keyframe_gap=self.cfg["loop_closing"]["min_keyframe_gap"],
+                                       consistency_checks=self.cfg["loop_closing"]["consistency_checks"])
+
+        # ── Visual-inertial state (Phase 3/4) ───────────────────────────
+        # imu_preint: the RUNNING preintegration accumulator since the last
+        # keyframe. Created once the first keyframe exists, reset every
+        # time a new keyframe is marked (see process() below). bias_* are
+        # carried forward as constants once imu_init.py succeeds (see that
+        # module's docstring for why bias isn't re-estimated online here).
+        self.imu_preint = None
+        self.imu_raw_buffer = []     # accumulated synchronized [t,gx,gy,gz,ax,ay,az] rows
+        self._last_imu_t = None
+        self.bias_gyro = np.zeros(3)
+        self.bias_accel = np.zeros(3)
+        self.last_ok_timestamp = None
+
+        self.frames = []
+        self._pending_dense_cleanup = None   # Phase 5: see the else-branch
+                                             # in process() for why this
+                                             # exists -- one-frame-deferred
+                                             # dense-data cleanup, needed
+                                             # since _track_dense now aligns
+                                             # against last_frame, not just
+                                             # last_keyframe.
+        self.init_candidate = None
+        self.consecutive_lost = 0
+        self.stats = {'tracked': 0, 'lost': 0, 'keyframes': 0,
+                      'points_created': 0, 'points_culled': 0, 'loops': 0,
+                      'points_fused': 0, 'keyframes_culled': 0,
+                      'imu_init_attempts': 0, 'relocalizations': 0}
+
+    def process(self, image, timestamp, depth_image=None, imu_samples=None):
+        """
+        imu_samples: optional (K,7) array of synchronized [t,gx,gy,gz,ax,ay,az]
+        rows (see imu.py) covering the interval since the previous process()
+        call. Already rotated into the camera frame. Ignored entirely
+        unless use_imu=True.
+        """
+        frame = Frame(image, timestamp, self.camera, self.extractor,
+                      depth_image=depth_image, keep_dense=True)
+        
+        # ── Diagnostic output immediately after creating each Frame ──
+        # BUGFIX: Frame has no `valid_depth_count` attribute -- this used to
+        # silently print 0 forever via getattr's fallback. n_valid_depths()
+        # is the real accessor (see frame.py).
+        if self.verbose:
+            print(f"[RGBD] Frame {frame.id}: keypoints={len(frame.keypoints)}, "
+                  f"valid_depth={frame.n_valid_depths()}")
+
+        self.frames.append(frame)
+        world_map = self.atlas.active_map
+
+        if self.use_imu and imu_samples is not None and len(imu_samples) > 0:
+            self._integrate_imu(imu_samples)
+
+        # ── initialisation ───────────────────────────────────────────────
+        if self.tracking.state == "NOT_INITIALIZED":
+            if self.use_depth:
+                ok, new_pts, fail_reason = initializer.init_rgbd(
+                    frame, world_map, min_points=self.cfg["initializer"]["rgbd_min_points"])
+                if ok:
+                    self.tracking.state = "OK"
+                    self.tracking.last_frame = frame
+                    self.tracking.mark_keyframe(frame)
+                    self.local_mapping.recent_points.extend(new_pts)
+                    self.stats['keyframes'] += 1
+                    self.stats['points_created'] += len(new_pts)
+                    self.last_ok_timestamp = timestamp
+                    self.keyframe_db.add_keyframe(frame)   # Phase 5
+                    if self.use_imu:
+                        self._start_imu_segment()
+                    self._log(f"[init] RGB-D success at frame {frame.id} "
+                              f"({len(new_pts)} points)")
+                else:
+                    self._log(f"[init] RGB-D failed at frame {frame.id}: {fail_reason}")
+            else:
+                if self.init_candidate is None:
+                    self.init_candidate = frame
+                    return frame
+                ok, new_pts = initializer.init_monocular(
+                    self.init_candidate, frame, self.matcher,
+                    self.camera, world_map)
+                if ok:
+                    self.tracking.state = "OK"
+                    self.tracking.last_frame = frame
+                    self.tracking.mark_keyframe(frame)
+                    self.local_mapping.recent_points.extend(new_pts)
+                    self.stats['keyframes'] += 2
+                    self.stats['points_created'] += len(new_pts)
+                    self.last_ok_timestamp = timestamp
+                    self.keyframe_db.add_keyframe(self.init_candidate)   # Phase 5
+                    self.keyframe_db.add_keyframe(frame)                 # Phase 5
+                    if self.use_imu:
+                        self._start_imu_segment()
+                    self._log(f"[init] mono success at frame {frame.id} "
+                              f"({len(new_pts)} points)")
+                else:
+                    self.init_candidate = frame   # slide the window forward
+                    if frame.id % 30 == 0:
+                        self._log(f"[init] waiting for parallax... frame {frame.id}")
+            return frame
+
+        # ── tracking ─────────────────────────────────────────────────────
+        ok = self.tracking.track(frame, imu_preint=self.imu_preint if self.use_imu else None)
+        if ok:
+            self.last_ok_timestamp = timestamp
+        if not ok:
+            self.stats['lost'] += 1
+            self.consecutive_lost += 1
+            self._log(f"[track] LOST at frame {frame.id} "
+                      f"(consecutive: {self.consecutive_lost})")
+
+            # Atlas behaviour: after sustained loss, abandon and start fresh.
+            # With IMU initialized, give the pipeline a TIME-based grace
+            # window instead of a fixed frame count -- tracking.py already
+            # keeps propagating frame.pose via IMU alone during this
+            # window (state RECENTLY_LOST), so a few seconds of bad visual
+            # conditions (motion blur, a blank wall) can recover instead of
+            # immediately abandoning the map.
+            elapsed_lost = timestamp - self.last_ok_timestamp if self.last_ok_timestamp is not None else 0.0
+            if self.use_imu and self.tracking.imu_initialized:
+                give_up = (elapsed_lost >= self.cfg["imu"]["recently_lost_max_seconds"]
+                           and self.consecutive_lost >= 3)
+            else:
+                give_up = self.consecutive_lost >= 10
+
+            # Phase 5: attempt relocalization BEFORE giving up. This is
+            # the direct fix for the original "no Relocalization()"
+            # gap flagged from this project's very first forensic pass --
+            # every sustained tracking loss used to permanently fragment
+            # the Atlas with zero recovery attempt. Tried on every LOST
+            # frame, not just once give_up triggers: a successful match
+            # here means we never fragment in the first place, whether
+            # the recognized place is in the CURRENTLY active map (no
+            # fragmentation ever happens) or an older, already-abandoned
+            # one (Atlas resumes it instead of starting yet another
+            # fragment -- see relocalization.py's docstring for why this
+            # switches maps rather than attempting a full merge, which is
+            # real, separate work deferred to Phase 6).
+            exclude_ids = {self.tracking.last_keyframe.id} if self.tracking.last_keyframe else None
+            relocalized, matched_map = relocalization.try_relocalize(
+                frame, self.keyframe_db, self.atlas, self.camera, self.matcher,
+                min_inliers=self.cfg["relocalization"]["min_inliers"],
+                top_n_candidates=self.cfg["relocalization"]["top_n_candidates"],
+                exclude_ids=exclude_ids)
+
+            if relocalized:
+                self._log(f"[reloc] recovered at frame {frame.id} into "
+                          f"map {matched_map.id} after {self.consecutive_lost} lost frames")
+                self.tracking.set_map(matched_map)
+                self.local_mapping.set_map(matched_map)
+                self.tracking.covis_graph = self.local_mapping.covis_graph
+                self.tracking.state = "OK"
+                self.tracking.last_frame = frame
+                self.tracking.velocity = None   # motion model has no basis to trust yet
+                self.consecutive_lost = 0
+                self.last_ok_timestamp = timestamp
+                self.stats['relocalizations'] = self.stats.get('relocalizations', 0) + 1
+                return frame
+
+            if give_up:
+                self._log(f"[atlas] starting NEW MAP after "
+                          f"{self.consecutive_lost} lost frames ({elapsed_lost:.2f}s)")
+                new_map = self.atlas.start_new_map()
+                self.tracking.set_map(new_map)
+                self.local_mapping.set_map(new_map)
+                self.tracking.covis_graph = self.local_mapping.covis_graph
+                self.tracking.state = "NOT_INITIALIZED"
+                self.tracking.last_frame = None
+                self.tracking.last_keyframe = None
+                self.tracking.velocity = None
+                self.tracking.imu_initialized = False
+                self.init_candidate = None
+                self.consecutive_lost = 0
+                self.imu_preint = None
+            return frame
+
+        self.consecutive_lost = 0
+        self.stats['tracked'] += 1
+        pose_only_optimize(frame, world_map, self.camera)
+
+        # ── keyframe -> local mapping ────────────────────────────────────
+        if self.tracking.needs_new_keyframe(frame):
+            new_pts, n_culled, n_fused = self.local_mapping.process_new_keyframe(
+                frame, use_depth=self.use_depth, depth_image=depth_image)
+            self.tracking.mark_keyframe(frame)
+            self.stats['keyframes'] += 1
+            self.stats['points_created'] += len(new_pts)
+            self.stats['points_culled'] += n_culled
+            self.stats['points_fused'] += n_fused
+            self.keyframe_db.add_keyframe(frame)   # Phase 5
+
+            if self.use_imu:
+                self._finalize_imu_segment(frame)
+
+            # KeyFrameCulling: drop redundant keyframes so covisibility
+            # rebuilds / BA windows / local-map matching don't grow forever
+            # over a facility-length walk. Cheap enough to run every
+            # keyframe; internally protects the most recent few.
+            #
+            # SKIPPED when IMU is active: each keyframe's imu_preint spans
+            # from its IMMEDIATE predecessor at recording time. If that
+            # predecessor gets culled, the chain imu_init.py and
+            # local_inertial_bundle_adjust walk (consecutive keyframes in
+            # world_map.keyframes) would silently desync from what each
+            # segment actually covers. Fixing that properly means re-
+            # concatenating preintegration segments across a cull, which
+            # is real work deferred for now -- see PROGRESS notes.
+            if not self.use_imu:
+                n_kf_culled, culled_ids = self.local_mapping.cull_keyframes()
+                self.stats['keyframes_culled'] += n_kf_culled
+                for kf_id in culled_ids:   # Phase 5: keep the inverted index consistent
+                    self.keyframe_db.remove_keyframe(kf_id)
+
+            # Re-enabled: the old dense/unbounded BA is what was hanging.
+            # bundle_adjust.py now uses a bounded window, a sparse
+            # graph-colored Jacobian, and only optimizes points with >=2
+            # observations -- see that module's docstring for why this no
+            # longer hangs. Real-time isn't a priority here, so this is
+            # allowed to take however long it needs; it just won't grow
+            # unbounded with map size anymore.
+            n_kf = world_map.n_keyframes()
+            if self.use_imu and not self.tracking.imu_initialized:
+                self._try_imu_init(world_map)
+
+            if self.use_imu and self.tracking.imu_initialized:
+                if n_kf >= 3:
+                    local_inertial_bundle_adjust(
+                        world_map, self.camera, gravity=self.tracking.gravity,
+                        bias_gyro=self.bias_gyro, bias_accel=self.bias_accel,
+                        window=self.cfg["imu"]["ba_window"], verbose=self.verbose)
+            elif n_kf >= 3:
+                # Phase 2: pick the BA backend from config. GTSAM path
+                # falls back to scipy with a warning if gtsam isn't
+                # installed or config asks for it incorrectly -- never
+                # silently no-ops bundle adjustment entirely.
+                backend = self.cfg["bundle_adjust"].get("backend", "scipy")
+                if backend == "gtsam" and local_bundle_adjust_gtsam is not None:
+                    local_bundle_adjust_gtsam(world_map, self.camera,
+                                              window=self.cfg["bundle_adjust"]["window"],
+                                              max_iter=self.cfg["bundle_adjust"]["max_iter"],
+                                              min_obs_to_optimize=self.cfg["bundle_adjust"]["min_obs_to_optimize"],
+                                              huber_f_scale=self.cfg["bundle_adjust"]["huber_f_scale"],
+                                              verbose=self.verbose)
+                else:
+                    if backend == "gtsam" and self.verbose:
+                        print("[BA] config requested gtsam backend but gtsam "
+                             "is not installed -- falling back to scipy")
+                    local_bundle_adjust(world_map, self.camera,
+                                        window=self.cfg["bundle_adjust"]["window"],
+                                        max_iter=self.cfg["bundle_adjust"]["max_iter"],
+                                        min_obs_to_optimize=self.cfg["bundle_adjust"]["min_obs_to_optimize"],
+                                        huber_f_scale=self.cfg["bundle_adjust"]["huber_f_scale"],
+                                        verbose=self.verbose)
+
+            # ── loop closing ─────────────────────────────────────────────
+            # Phase 5: vocab.build() call removed -- ORBVocabulary loads a
+            # complete, pre-trained vocabulary once at startup (see
+            # orb_vocabulary.py) and needs no periodic rebuilding, unlike
+            # the old KMeans placeholder this replaces. The n_kf>=20 gate
+            # remains for detect_loop() itself for now -- proper Atlas-
+            # wide loop closing with consistency groups is Phase 6 scope;
+            # this phase's actual deliverable for the "camera returns to
+            # an already-mapped place" problem is relocalization.py,
+            # triggered from the LOST-handling block below, not this gate.
+            if n_kf % 10 == 0 and n_kf >= 20:
+                result = self.loop_closer.detect_loop(frame, world_map)
+                if result is not None:
+                    matched_kf, sim, inliers = result
+                    drift = self.loop_closer.measure_drift(frame, matched_kf)
+                    self.stats['loops'] += 1
+                    self._log(f"[LOOP] kf {frame.id} <-> kf {matched_kf.id} | "
+                              f"sim={sim:.3f} inliers={inliers} | "
+                              f"drift={drift:.3f}m (NOT corrected)")
+        else:
+            # Phase 5 ARCHITECTURE FIX: dense fallback now aligns against
+            # self.last_frame (see tracking.py._track_dense's docstring
+            # for why -- a stale last_keyframe reference made the
+            # photometric-residual quality check unfixable by threshold
+            # tuning alone). That means a non-keyframe frame's dense data
+            # is still needed for exactly ONE more frame after this one
+            # (whichever frame comes next may need it as ITS last_frame
+            # reference), so clearing it immediately here is one frame
+            # too early. Deferred: this frame is queued for cleanup, and
+            # the actually-deferred clear happens at the top of the NEXT
+            # process() call, once we know this frame is no longer
+            # `self.tracking.last_frame` for anyone.
+            if self._pending_dense_cleanup is not None:
+                self._pending_dense_cleanup.gray_image = None
+                self._pending_dense_cleanup.depth_m = None
+            self._pending_dense_cleanup = frame
+        return frame
+
+    # ── IMU orchestration (Phase 3/4) ───────────────────────────────────
+
+    def _integrate_imu(self, imu_samples):
+        """Append raw synchronized samples to the running buffer (used by
+        imu_init's observability gate) and integrate them into the RUNNING
+        preintegration segment since the last keyframe, if one exists yet."""
+        self.imu_raw_buffer.extend(imu_samples.tolist())
+        if self.imu_preint is None:
+            return
+        t_prev = self._last_imu_t
+        for row in imu_samples:
+            t, gx, gy, gz, ax, ay, az = row
+            if t_prev is not None:
+                self.imu_preint.integrate_sample([gx, gy, gz], [ax, ay, az], t - t_prev)
+            t_prev = t
+        self._last_imu_t = t_prev
+
+    def _start_imu_segment(self):
+        """Begin accumulating a fresh preintegration segment from the
+        just-created (first) keyframe forward."""
+        self.imu_preint = imu.Preintegration(
+            self.bias_gyro, self.bias_accel,
+            noise_gyro=self.cfg["imu"]["noise_gyro"],
+            noise_accel=self.cfg["imu"]["noise_accel"])
+        self._last_imu_t = None
+
+    def _finalize_imu_segment(self, keyframe):
+        """Attach the just-completed segment to the new keyframe and start
+        the next one."""
+        if self.imu_preint is None:
+            self._start_imu_segment()
+            return
+        keyframe.imu_preint = self.imu_preint
+        keyframe.bias_gyro = self.bias_gyro.copy()
+        keyframe.bias_accel = self.bias_accel.copy()
+        self._start_imu_segment()
+
+    def _try_imu_init(self, world_map):
+        """
+        Attempt staged inertial initialization (imu_init.py) once enough
+        keyframes with attached preintegration segments exist. On success,
+        assigns velocities to those keyframes, stores gravity/bias, and
+        flips tracking.imu_initialized so future frames get IMU prediction
+        and future keyframes get inertial BA.
+        """
+        kfs = [kf for kf in world_map.keyframes if kf.imu_preint is not None or kf.kf_seq == 0]
+        kfs = sorted(kfs, key=lambda kf: kf.kf_seq)
+        min_kf = self.cfg["imu"]["init_min_keyframes"]
+        if len(kfs) < min_kf:
+            return
+        if kfs[-1].timestamp - kfs[0].timestamp < self.cfg["imu"]["init_window_seconds"]:
+            return
+
+        self.stats['imu_init_attempts'] += 1
+        sync_samples = np.asarray(self.imu_raw_buffer) if self.imu_raw_buffer else np.zeros((0, 7))
+        result = imu_init.initialize(
+            kfs, sync_samples,
+            gravity_mag=self.cfg["imu"]["gravity_magnitude"],
+            min_gyro_std=self.cfg["imu"]["observability_min_gyro_std"],
+            min_accel_std=self.cfg["imu"]["observability_min_accel_std"])
+
+        if not result["success"]:
+            self._log(f"[imu-init] not ready yet: {result['reason']}")
+            return
+
+        for kf, v in zip(kfs, result["velocities"]):
+            kf.velocity = v
+        self.bias_gyro = result["bias_gyro"]
+        self.bias_accel = result["bias_accel"]
+        self.tracking.gravity = result["gravity"]
+        self.tracking.imu_initialized = True
+        self._log(f"[imu-init] SUCCESS: gravity={np.round(result['gravity'], 3)} "
+                  f"|g|={np.linalg.norm(result['gravity']):.3f} "
+                  f"bias_gyro={np.round(result['bias_gyro'], 4)} "
+                  f"bias_accel={np.round(result['bias_accel'], 4)}")
+
+        # Fold the initialization straight into the map once (stands in for
+        # ORB-SLAM3's VIBA1/VIBA2 re-refinement passes -- see
+        # imu_init.py's docstring for why those aren't implemented here).
+        local_inertial_bundle_adjust(world_map, self.camera, gravity=self.tracking.gravity,
+                                     bias_gyro=self.bias_gyro, bias_accel=self.bias_accel,
+                                     window=len(kfs), verbose=self.verbose)
+
+    def _log(self, msg):
+        if self.verbose:
+            print(msg)
+
+    # ── outputs ──────────────────────────────────────────────────────────
+
+    def save_trajectory_plot(self, path="trajectory_python.png"):
+        poses = [f.pose for f in self.frames if f.pose is not None]
+        if len(poses) < 2:
+            print("Not enough poses to plot.")
+            return None
+
+        c = np.array([p[:3, 3] for p in poses])
+        kf_c = np.array([kf.camera_center() for m in self.atlas.maps
+                            for kf in m.keyframes if kf.pose is not None])
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        for ax, (i, j), (xl, yl), title in (
+                (axes[0], (0, 2), ("X (m)", "Z (m)"), "Bird's-eye (X-Z)"),
+                (axes[1], (0, 1), ("X (m)", "Y (m)"), "Front (X-Y)")):
+            ax.plot(c[:, i], c[:, j], '-', lw=1.2, color='tab:orange', label='trajectory')
+            if len(kf_c):
+                ax.scatter(kf_c[:, i], kf_c[:, j], s=14, color='tab:blue',
+                           zorder=4, label='keyframes')
+            ax.scatter([c[0, i]], [c[0, j]], s=70, c='green', marker='o',
+                       edgecolors='k', zorder=5, label='start')
+            ax.scatter([c[-1, i]], [c[-1, j]], s=70, c='red', marker='s',
+                       edgecolors='k', zorder=5, label='end')
+            ax.set_xlabel(xl); ax.set_ylabel(yl); ax.set_title(title)
+            ax.set_aspect('equal', adjustable='datalim')
+            ax.grid(alpha=0.3); ax.legend(fontsize=8)
+
+        fig.suptitle("Python ORB-SLAM3 reimplementation")
+        fig.tight_layout()
+        fig.savefig(path, dpi=130, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved {path}")
+        return path
+
+    def save_map_ply(self, path="map_points.ply"):
+        pts = [mp.position for m in self.atlas.maps
+               for mp in m.good_map_points()]
+        if not pts:
+            return None
+        pts = np.asarray(pts)
+        with open(path, 'w') as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {len(pts)}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("end_header\n")
+            for p in pts:
+                f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+        print(f"Saved {path} ({len(pts)} points)")
+        return path
+
+    def print_summary(self):
+        n_posed = sum(1 for f in self.frames if f.pose is not None)
+        total = len(self.frames)
+        print("\n" + "=" * 60)
+        print("  SUMMARY")
+        print("=" * 60)
+        print(f"Frames processed:    {total}")
+        print(f"Frames with pose:    {n_posed} ({100.0 * n_posed / max(1, total):.1f}%)")
+        print(f"Tracking successes:  {self.stats['tracked']}")
+        print(f"Tracking losses:     {self.stats['lost']}")
+        print(f"Keyframes:           {self.stats['keyframes']}")
+        print(f"Keyframes culled:    {self.stats['keyframes_culled']}")
+        print(f"Map points created:  {self.stats['points_created']}")
+        print(f"Map points culled:   {self.stats['points_culled']}")
+        print(f"Map points fused:    {self.stats['points_fused']}")
+        print(f"Loop closures found: {self.stats['loops']}")
+        print()
+        print(self.atlas.summary())
+
+        poses = [f.pose for f in self.frames if f.pose is not None]
+        if len(poses) >= 2:
+            c = np.array([p[:3, 3] for p in poses])
+            path_len = float(np.sum(np.linalg.norm(np.diff(c, axis=0), axis=1)))
+            net = float(np.linalg.norm(c[-1] - c[0]))
+            print(f"\nPath length:      {path_len:.3f}"
+                  f"{' m' if self.use_depth else ' (arbitrary units)'}")
+            print(f"Net displacement: {net:.3f}"
+                  f"{' m' if self.use_depth else ' (arbitrary units)'}")
+            if not self.use_depth:
+                print("  NOTE: monocular = no absolute scale. Distances are "
+                      "relative only.")
+        print("=" * 60)
+
+
+# ── runners ──────────────────────────────────────────────────────────────
+
+def run_realsense(args):
+    """
+    Live capture. Default path tracks on the COLOR image (fixed: intrinsics
+    now genuinely come from the color stream that gets aligned-to and fed
+    to the extractor, and baseline comes from real extrinsics -- see
+    camera.py's docstring for what was wrong before).
+
+    --ir switches to the recommended pipeline: track on the left infrared
+    image instead. Global-shutter IR pairs better with future IMU
+    preintegration than the rolling-shutter RGB sensor, and depth is
+    natively registered to it (no rs.align needed at all). Only worth it if
+    the facility has enough natural texture for emitter-off IR frames to be
+    usable -- see the architecture notes. Uses emitter_on_off alternating
+    mode: even frames keep the projector pattern (for depth), odd frames
+    are clean for ORB (real-time isn't a priority, so halving the rate is fine).
+    """
+    import pyrealsense2 as rs
+
+    if args.ir:
+        camera = Camera.from_realsense_ir(args.width, args.height, args.fps)
+    else:
+        camera = Camera.from_realsense(args.width, args.height, args.fps)
+    print(camera)
+    os.makedirs("calibration", exist_ok=True)
+    camera.to_json("calibration/realsense_d435.json")
+
+    slam = SLAMSystem(camera, use_depth=not args.mono, verbose=not args.quiet)
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+    if args.ir:
+        config.enable_stream(rs.stream.infrared, 1, args.width, args.height, rs.format.y8, args.fps)
+        config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+    else:
+        config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
+        config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+        align = rs.align(rs.stream.color)
+
+    profile = pipeline.start(config)
+
+    if args.ir:
+        depth_sensor = profile.get_device().first_depth_sensor()
+        if depth_sensor.supports(rs.option.global_time_enabled):
+            depth_sensor.set_option(rs.option.global_time_enabled, 1)
+        for s in profile.get_device().sensors:
+            if s.supports(rs.option.global_time_enabled):
+                s.set_option(rs.option.global_time_enabled, 1)
+        if depth_sensor.supports(rs.option.emitter_on_off):
+            depth_sensor.set_option(rs.option.emitter_on_off, 1)
+            depth_sensor.set_option(rs.option.emitter_enabled, 1)
+
+    total_target_frames = args.fps * args.seconds
+    print(f"\nStreaming at {args.fps} FPS. Capturing approximately {total_target_frames} target frames ({args.fps} per second over {args.seconds} seconds).\n")
+
+    t0 = time.time()
+    processed_count = 0
+    frame_counter = 0
+    pending_ir_clean = None   # holds the last emitter-off IR frame while we wait for the paired depth
+
+    try:
+        while processed_count < total_target_frames:
+            frames = pipeline.wait_for_frames()
+
+            if args.ir:
+                ir = frames.get_infrared_frame(1)
+                depth = frames.get_depth_frame()
+                if not ir:
+                    continue
+                try:
+                    emitter_on = bool(ir.get_frame_metadata(
+                        rs.frame_metadata_value.frame_laser_power_mode))
+                except Exception:
+                    emitter_on = (frame_counter % 2 == 0)
+
+                if emitter_on:
+                    if pending_ir_clean is not None and depth:
+                        color_img = pending_ir_clean
+                        depth_img = np.asanyarray(depth.get_data()) if not args.mono else None
+                        pending_ir_clean = None
+                    else:
+                        frame_counter += 1
+                        continue
+                else:
+                    pending_ir_clean = np.asanyarray(ir.get_data())
+                    frame_counter += 1
+                    continue
+            else:
+                frames = align.process(frames)
+                color = frames.get_color_frame()
+                depth = frames.get_depth_frame()
+                if not color:
+                    continue
+                frame_counter += 1
+                color_img = np.asanyarray(color.get_data())
+                depth_img = np.asanyarray(depth.get_data()) if (depth and not args.mono) else None
+
+            processed_count += 1
+            print(f"Processing target frame {processed_count}/{total_target_frames}")
+            slam.process(color_img, time.time() - t0, depth_image=depth_img)
+
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    finally:
+        pipeline.stop()
+
+    return slam
+
+
+def run_frames(args):
+    if args.calib:
+        camera = Camera.from_json(args.calib)
+    else:
+        print("ERROR: --frames needs --calib <calibration.json>")
+        sys.exit(1)
+    print(camera)
+
+    paths = sorted(glob.glob(os.path.join(args.frames, "*.png")) +
+                   glob.glob(os.path.join(args.frames, "*.jpg")))
+    if args.max_frames:
+        paths = paths[:args.max_frames]
+    if not paths:
+        print(f"No images found in {args.frames}")
+        sys.exit(1)
+    print(f"Found {len(paths)} frames\n")
+
+    slam = SLAMSystem(camera, use_depth=False, verbose=not args.quiet)
+    for i, p in enumerate(paths):
+        img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        slam.process(img, i / float(args.fps))
+    return slam
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Python ORB-SLAM3 reimplementation")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--realsense", action="store_true", help="live D435 input")
+    src.add_argument("--frames", type=str, help="directory of image frames")
+
+    ap.add_argument("--calib", type=str, help="calibration JSON (for --frames)")
+    ap.add_argument("--seconds", type=int, default=30, help="capture duration")
+    ap.add_argument("--max_frames", type=int, default=None)
+    ap.add_argument("--width", type=int, default=640)
+    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--mono", action="store_true",
+                    help="ignore depth even on RealSense (monocular mode)")
+    ap.add_argument("--ir", action="store_true",
+                    help="track on left IR (global shutter, natively depth-"
+                         "registered) instead of RGB. See camera.py docstring. "
+                         "Only worth it if the facility has enough natural "
+                         "texture for emitter-off IR frames to be usable.")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    slam = run_realsense(args) if args.realsense else run_frames(args)
+
+    slam.print_summary()
+    slam.save_trajectory_plot()
+    slam.save_map_ply()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+"""
+tracking.py — estimate the camera pose for every incoming frame.
+
+Maps to: ORB_SLAM3/src/Tracking.cc
+  Track()                 -> track()
+  TrackWithMotionModel    -> _track_with_motion_model()
+  TrackReferenceKeyFrame  -> _track_reference_keyframe()
+  PoseOptimization        -> solvePnPRansac (scipy-free, OpenCV does it)
+  NeedNewKeyFrame         -> needs_new_keyframe()
+
+State machine mirrors the real one: NOT_INITIALIZED -> OK -> RECENTLY_LOST -> LOST
+
+SIMPLIFICATIONS:
+  - No Relocalization() (full-database recovery when totally lost)
+  - No TrackLocalMap() refinement pass over all nearby map points
+  - No isInFrustum visibility filtering before matching
+"""
+
+import cv2
+import numpy as np
+
+import covisibility
+import dense_odometry
+
+TH_LOW = 50   # ORBmatcher::TH_LOW — same strict threshold matcher.py uses
+
+
+def _hamming(a, b):
+    return int(np.count_nonzero(np.unpackbits(np.bitwise_xor(a, b))))
+
+
+class Tracking:
+    def __init__(self, camera, extractor, matcher, world_map,
+                 min_matches_for_pose=15,
+                 keyframe_min_matches=50,
+                 keyframe_min_displacement=0.10,
+                 keyframe_max_frames=20,
+                 use_dense_fallback=True,
+                 dense_depth_trunc=5.0):
+        self.camera = camera
+        self.extractor = extractor
+        self.matcher = matcher
+        self.map = world_map
+        self.use_dense_fallback = use_dense_fallback
+        self.dense_depth_trunc = dense_depth_trunc
+        self.n_dense_fallback_used = 0
+        self.n_dense_fallback_attempted = 0
+
+        self.state = "NOT_INITIALIZED"
+        self.last_frame = None
+        self.last_keyframe = None
+        self.velocity = None            # 4x4 relative motion, for the motion model
+        self.frames_since_keyframe = 0
+
+        # Shared reference to LocalMapping's covisibility graph (see
+        # covisibility.py). Set by SLAMSystem right after constructing
+        # both objects. None until the first keyframe exists, in which
+        # case tracking falls back to the old whole-map match (there's
+        # nothing to be local ABOUT yet).
+        self.covis_graph = None
+
+        # Visual-inertial state (Phase 3/4). Set by SLAMSystem once
+        # imu_init.py succeeds. Before that, IMU prediction is skipped and
+        # tracking behaves exactly as it did visual-only.
+        self.imu_initialized = False
+        self.gravity = None
+
+        self.min_matches_for_pose = min_matches_for_pose
+        self.keyframe_min_matches = keyframe_min_matches
+        self.keyframe_min_displacement = keyframe_min_displacement
+        self.keyframe_max_frames = keyframe_max_frames
+
+    def set_map(self, world_map):
+        """Called when Atlas switches to a new active map."""
+        self.map = world_map
+
+    # ── main entry point ─────────────────────────────────────────────────
+
+    def track(self, frame, imu_preint=None):
+        """
+        Estimate frame.pose. Returns True on success.
+
+        imu_preint: the RUNNING imu.Preintegration accumulator since
+        self.last_keyframe (see run_slam.py) -- a valid PARTIAL
+        preintegration even before the segment is finalized at the next
+        keyframe. Used for IMU-predicted pose ONLY after imu_init.py has
+        succeeded (self.imu_initialized); before that this is ignored and
+        tracking behaves exactly as it did visual-only.
+        """
+        if self.state == "NOT_INITIALIZED":
+            return False
+
+        ok = False
+        predicted_pose, predicted_vel = None, None
+        if (self.imu_initialized and imu_preint is not None and
+                self.last_keyframe is not None and self.last_keyframe.velocity is not None):
+            predicted_pose, predicted_vel = self._predict_pose_imu(self.last_keyframe, imu_preint)
+
+        # Strategy 0: IMU-predicted pose, verified with PnP. Large
+        # robustness win through fast rotation / motion blur -- exactly the
+        # failure mode that used to trip consecutive_lost with only a
+        # constant-velocity model to fall back on.
+        if predicted_pose is not None:
+            ok = self._track_with_motion_model(frame, initial_pose=predicted_pose)
+            if ok:
+                frame.velocity = predicted_vel
+
+        # Strategy 1: constant-velocity motion model (fast)
+        if not ok and self.velocity is not None and self.last_frame is not None:
+            ok = self._track_with_motion_model(frame)
+
+        # Strategy 2: fall back to matching against the local map
+        if not ok:
+            ok = self._track_reference_keyframe(frame)
+
+        # Strategy 3 (Phase 4): dense RGB-D alignment fallback, tried only
+        # when BOTH sparse strategies above have already failed. This is
+        # the direct answer to a failure mode no amount of sparse-feature
+        # tuning can fix: a genuinely low-texture surface (a plain wall)
+        # can have zero extractable ORB corners at any threshold, simply
+        # because there's no intensity variation for any corner detector
+        # to find (verified across ORB/SIFT/AKAZE -- see PROGRESS.md).
+        # Dense alignment uses whole-image photometric+geometric
+        # gradients instead of sparse corners, which stay informative
+        # even where sparse ones don't exist. See dense_odometry.py's
+        # module docstring for why this is tried LAST, not first: it's
+        # more expensive per-call and doesn't produce new map-point
+        # correspondences the way sparse tracking does, so it's a safety
+        # net for otherwise-lost frames, not a general replacement.
+        dense_used = False
+        if (not ok and self.use_dense_fallback and self.last_frame is not None
+                and self.last_frame.gray_image is not None
+                and frame.gray_image is not None):
+            ok, dense_used = self._track_dense(frame)
+
+        if ok:
+            # TrackLocalMap: now that we have an initial pose, expand
+            # matches against the WIDER local map (K1+K2 covisible
+            # keyframes) using frustum culling + guided matching, instead
+            # of stopping at whatever the fast initial estimate found. This
+            # is what used to be missing entirely -- the old code had no
+            # refinement pass, so tracking quality was capped by whichever
+            # of the two cheap strategies fired.
+            n_expanded = self._track_local_map(frame)
+
+            self.state = "OK"
+            # update motion model: velocity = current * inverse(last)
+            if self.last_frame is not None and self.last_frame.pose is not None:
+                self.velocity = frame.pose @ np.linalg.inv(self.last_frame.pose)
+                # Diagnostic: Print out frame-to-frame motion delta
+                trans_vector = self.velocity[:3, 3]
+                trans_dist = np.linalg.norm(trans_vector)
+                dense_tag = " [DENSE FALLBACK]" if dense_used else ""
+                print(f"[TRACK] Frame {frame.id} Motion -> Trans: [{trans_vector[0]:.3f}, {trans_vector[1]:.3f}, {trans_vector[2]:.3f}] (Dist: {trans_dist:.3f}m) | +{n_expanded} local-map matches{dense_tag}")
+
+            self.last_frame = frame
+            self.frames_since_keyframe += 1
+        elif predicted_pose is not None:
+            # RECENTLY_LOST + IMU initialized: carry the pose forward via
+            # IMU integration alone rather than dropping it entirely. This
+            # is what lets a facility-length walk survive a few seconds of
+            # bad visual conditions (motion blur, a blank wall) instead of
+            # abandoning the map -- see run_slam.py's recently_lost handling
+            # for how long this is allowed to continue before giving up.
+            frame.set_pose(predicted_pose)
+            frame.velocity = predicted_vel
+            self.state = "RECENTLY_LOST"
+            self.last_frame = frame
+        else:
+            self.state = "RECENTLY_LOST" if self.state == "OK" else "LOST"
+            self.velocity = None
+
+        return ok
+
+    def _predict_pose_imu(self, last_keyframe, preint):
+        """
+        Standard IMU state propagation from the last keyframe's (pose,
+        velocity) using the running preintegration (see imu.py). Both
+        states live directly in the camera frame (see imu.py's docstring
+        on the lever-arm simplification), so no extrinsic conversion is
+        needed here.
+        """
+        R_i = last_keyframe.pose[:3, :3]
+        p_i = last_keyframe.pose[:3, 3]
+        v_i = last_keyframe.velocity
+        dt = preint.dt
+
+        R_j = R_i @ preint.dR
+        v_j = v_i + self.gravity * dt + R_i @ preint.dv
+        p_j = p_i + v_i * dt + 0.5 * self.gravity * dt ** 2 + R_i @ preint.dp
+
+        pose = np.eye(4)
+        pose[:3, :3] = R_j
+        pose[:3, 3] = p_j
+        return pose, v_j
+
+    def _track_dense(self, frame):
+        """
+        Phase 4 fallback strategy, ARCHITECTURE FIX applied during Phase 5
+        verification: aligns `frame` against self.last_frame (the most
+        recently processed frame, whether or not it's a keyframe), NOT
+        self.last_keyframe as originally implemented. Sets frame.pose
+        directly and returns (success, dense_used_bool).
+
+        WHY THIS CHANGED FROM last_keyframe TO last_frame: found via a
+        Phase 5 test that revealed the photometric-residual quality check
+        (see dense_odometry.py) cannot be fixed by threshold tuning alone
+        against a stale keyframe reference. Measured directly: a
+        deliberately-uncorrelated noise pair gave residual=31.4, while a
+        LEGITIMATE alignment against a keyframe from before a textured-to-
+        blank-wall transition gave residual=70-72 on a frame well into the
+        blank segment -- i.e. the genuinely correct case scored WORSE than
+        the genuinely garbage case, because the reference keyframe's
+        visual content had simply moved on by the time it's used many
+        frames later. No single residual threshold can separate these,
+        because the problem isn't alignment correctness, it's reference
+        staleness. This is also how real dense visual odometry is
+        actually built: incremental frame-to-frame chaining (keyframes
+        are for loop closure / global consistency, not moment-to-moment
+        dense tracking), not always anchoring to a single, potentially
+        distant keyframe.
+
+        MEMORY CONSEQUENCE: run_slam.py now retains dense image/depth
+        data for one extra frame (the previous frame, not just keyframes)
+        rather than clearing immediately -- see that file's cleanup logic
+        for the exact retention window.
+
+        Deliberately does NOT create map-point correspondences the way
+        sparse tracking does -- frame.map_point_ids stays all-None for a
+        dense-recovered frame. This is a real, documented limitation: a
+        dense-only frame contributes a pose to the trajectory but no new
+        landmarks to the map. Acceptable for a fallback whose job is
+        "don't lose the trajectory through a textureless patch," not
+        "map the textureless patch densely" (that's a different, larger
+        feature -- true dense reconstruction is Phase 9).
+        """
+        self.n_dense_fallback_attempted += 1
+        init_guess = None
+        if self.velocity is not None and self.last_frame.pose is not None:
+            init_guess = self.velocity @ self.last_frame.pose
+
+        ok, T_rel, info = dense_odometry.try_align(
+            self.last_frame.gray_image, self.last_frame.depth_m,
+            frame.gray_image, frame.depth_m, self.camera,
+            init_guess=init_guess, depth_trunc=self.dense_depth_trunc)
+
+        if not ok:
+            return False, False
+
+        frame.set_pose(self.last_frame.pose @ T_rel)
+        self.n_dense_fallback_used += 1
+        return True, True
+
+    # ── strategies ───────────────────────────────────────────────────────
+
+    def _track_with_motion_model(self, frame, initial_pose=None):
+        """
+        Predict the pose (from IMU if `initial_pose` is given, else from
+        constant velocity), then verify with PnP against the map points the
+        LAST frame was tracking (a small, likely-visible set).
+        """
+        if initial_pose is None:
+            if self.last_frame is None or self.last_frame.pose is None:
+                return False
+
+        # Candidate points: only those the previous frame saw
+        cand_ids, cand_descs = [], []
+        for mp_id in self.last_frame.map_point_ids:
+            if mp_id is None:
+                continue
+            mp = self.map.map_points.get(mp_id)
+            if mp is None or mp.is_bad or mp.descriptor is None:
+                continue
+            cand_ids.append(mp_id)
+            cand_descs.append(mp.descriptor)
+
+        if len(cand_ids) < self.min_matches_for_pose:
+            return False
+
+        cand_descs = np.asarray(cand_descs, dtype=np.uint8)
+        return self._solve_pnp(frame, cand_ids, cand_descs, initial_pose=initial_pose)
+
+    def _track_reference_keyframe(self, frame):
+        """
+        Match against the LOCAL map, not the whole map.
+
+        BUGFIX: this used to call self.map.all_descriptors() -- every good
+        point in the ENTIRE map, growing without bound (a 1200x30000
+        Hamming match at 30k points, EVERY frame this strategy fired).
+        Replaced with covisibility.py's K1+K2 local map: the reference
+        keyframe's strongly-covisible neighbors plus their neighbors, which
+        stays roughly constant-sized as the facility grows because it's
+        bounded by local connectivity, not total map size.
+        """
+        if self.last_keyframe is None or self.covis_graph is None:
+            # No keyframes yet to be local ABOUT (e.g. right after init) --
+            # fall back to whatever the map currently has.
+            ids, descs = self.map.all_descriptors()
+            if descs is None or len(ids) < self.min_matches_for_pose:
+                return False
+            return self._solve_pnp(frame, ids, descs)
+
+        local_kfs = covisibility.local_keyframes(self.last_keyframe, self.covis_graph, self.map)
+        local_pt_ids = covisibility.local_map_points(local_kfs, self.map)
+        ids, descs = [], []
+        for mp_id in local_pt_ids:
+            mp = self.map.map_points.get(mp_id)
+            if mp is not None and not mp.is_bad and mp.descriptor is not None:
+                ids.append(mp_id)
+                descs.append(mp.descriptor)
+        if len(ids) < self.min_matches_for_pose:
+            return False
+        return self._solve_pnp(frame, ids, np.asarray(descs, dtype=np.uint8))
+
+    def _track_local_map(self, frame):
+        """
+        Tracking::TrackLocalMap(): once an initial pose exists (from either
+        the motion model or _track_reference_keyframe), expand the match
+        set against the WIDER local map using frustum culling + guided
+        matching, rather than accepting whatever the fast initial strategy
+        found. This is what turns per-frame matching from O(map size) into
+        O(local map size) end-to-end, and is what lets tracking stay
+        reliable as the facility (and total map) gets larger. Returns the
+        number of newly added matches.
+        """
+        if self.last_keyframe is None or self.covis_graph is None or frame.pose is None:
+            return 0
+
+        local_kfs = covisibility.local_keyframes(self.last_keyframe, self.covis_graph, self.map)
+        local_pt_ids = covisibility.local_map_points(local_kfs, self.map)
+        already_tracked = set(mp_id for mp_id in frame.map_point_ids if mp_id is not None)
+
+        n_levels = self.extractor.nlevels
+        scale_factor = self.extractor.scale_factor
+        n_new = 0
+
+        for mp_id in local_pt_ids:
+            if mp_id in already_tracked:
+                continue
+            mp = self.map.map_points.get(mp_id)
+            if mp is None or mp.is_bad or mp.descriptor is None:
+                continue
+
+            visible, u, v, octave = covisibility.is_in_frustum(
+                mp, frame, self.camera, n_levels=n_levels, scale_factor=scale_factor)
+            if not visible:
+                continue
+            mp.increase_visible()
+
+            radius = 4.0 * (scale_factor ** octave if octave else 1.0)
+            candidates = frame.get_features_in_area(
+                u, v, radius, min_level=max(0, octave - 1), max_level=octave + 1)
+            if not candidates:
+                continue
+
+            best_dist, best_idx = TH_LOW + 1, -1
+            for kp_i in candidates:
+                if frame.map_point_ids[kp_i] is not None:
+                    continue   # slot already claimed by another match this frame
+                d = _hamming(mp.descriptor, frame.descriptors[kp_i])
+                if d < best_dist:
+                    best_dist, best_idx = d, kp_i
+            if best_idx < 0 or best_dist > TH_LOW:
+                continue
+
+            frame.map_point_ids[best_idx] = mp.id
+            mp.increase_found()
+            already_tracked.add(mp.id)
+            n_new += 1
+
+        return n_new
+
+    def _solve_pnp(self, frame, mp_ids, mp_descs, initial_pose=None):
+        """
+        Match frame descriptors to candidate map point descriptors, build
+        2D-3D correspondences, solve for pose with PnP + RANSAC.
+
+        initial_pose: optional camera-to-world 4x4 (from IMU prediction) fed
+        to solvePnPRansac via useExtrinsicGuess=True -- lets RANSAC start
+        from a good guess instead of searching cold, which matters most
+        exactly when motion is fast/blurred (the case IMU prediction is
+        for in the first place).
+        """
+        if frame.descriptors is None or len(frame.descriptors) == 0:
+            return False
+
+        # BUGFIX (Phase 3): this used to be self.matcher.match(...) --
+        # crossCheck-only, no ratio test. match_ratio() existed as a
+        # method since Phase 0 but was never actually called from
+        # anywhere in the live tracking path. Real logs (frame ~145 in
+        # the original D435i debugging session) showed exactly the
+        # failure mode this fixes: raw match counts stayed high (50-70)
+        # through a rotation, but RANSAC inliers collapsed to 0-9 --
+        # consistent with descriptor ambiguity producing plausible-
+        # looking but geometrically wrong correspondences that crossCheck
+        # alone doesn't catch.
+        #
+        # NOTE ON WHAT WASN'T ADDED HERE: matcher.py's new
+        # rotation_consistency_filter() is NOT applied at this call site.
+        # It needs a genuine second VIEW with real per-keypoint angles on
+        # both sides (matching corners under one rigid rotation should
+        # agree on angle delta). `mp_descs` here is each MapPoint's single
+        # representative descriptor -- chosen via median-Hamming distance
+        # across potentially dozens of past observations from different
+        # viewpoints (see map_point.py's update_descriptor) -- which has
+        # no single meaningful "angle" to compare against. Applying the
+        # rotation histogram here would be comparing frame.keypoints'
+        # angles against a quantity that isn't a real angle at all. See
+        # initializer.py for where this technique IS correctly applicable
+        # (genuine frame-vs-frame matching, both sides real keypoints).
+        matches = self.matcher.match_ratio(frame.descriptors, mp_descs)
+        if len(matches) < self.min_matches_for_pose:
+            return False
+
+        pts_2d, pts_3d, kp_indices, matched_mp_ids = [], [], [], []
+        for m in matches:
+            mp = self.map.map_points.get(mp_ids[m.trainIdx])
+            if mp is None or mp.is_bad:
+                continue
+            pts_2d.append(frame.points_undistorted[m.queryIdx])
+            pts_3d.append(mp.position)
+            kp_indices.append(m.queryIdx)
+            matched_mp_ids.append(mp.id)
+            mp.increase_visible()
+
+        if len(pts_3d) < 6:
+            return False
+
+        pts_2d = np.asarray(pts_2d, dtype=np.float64)
+        pts_3d = np.asarray(pts_3d, dtype=np.float64)
+
+        if initial_pose is not None:
+            pose_cw_guess = np.linalg.inv(initial_pose)
+            rvec0, _ = cv2.Rodrigues(pose_cw_guess[:3, :3])
+            tvec0 = pose_cw_guess[:3, 3].reshape(3, 1)
+            ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+                pts_3d, pts_2d, self.camera.K, None,
+                rvec0.copy(), tvec0.copy(), useExtrinsicGuess=True,
+                iterationsCount=200, reprojectionError=3.0,
+                confidence=0.99, flags=cv2.SOLVEPNP_ITERATIVE)
+        else:
+            ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+                pts_3d, pts_2d, self.camera.K, None,
+                iterationsCount=200, reprojectionError=3.0,
+                confidence=0.99, flags=cv2.SOLVEPNP_ITERATIVE)
+
+        inlier_count = len(inliers) if (inliers is not None) else 0
+        print(f"[TRACK] Frame {frame.id}: Raw Matches={len(matches)}, RANSAC Inliers={inlier_count}")
+
+        if not ok or inliers is None or len(inliers) < self.min_matches_for_pose:
+            return False
+
+        # solvePnP gives world-to-camera; invert for camera-to-world
+        R, _ = cv2.Rodrigues(rvec)
+        T_wc = np.eye(4)
+        T_wc[:3, :3] = R
+        T_wc[:3, 3] = tvec.flatten()
+        frame.set_pose(np.linalg.inv(T_wc))
+
+        # Record only the inlier associations
+        inlier_set = set(int(i) for i in inliers.flatten())
+        for k, (kp_i, mp_id) in enumerate(zip(kp_indices, matched_mp_ids)):
+            if k in inlier_set:
+                frame.map_point_ids[kp_i] = mp_id
+                mp = self.map.map_points.get(mp_id)
+                if mp:
+                    mp.increase_found()
+
+        return True
+
+    # ── keyframe decision ────────────────────────────────────────────────
+
+    def needs_new_keyframe(self, frame):
+        """
+        Tracking::NeedNewKeyFrame(), simplified.
+        Insert a keyframe if we've drifted far enough, waited long enough,
+        or tracking quality has dropped.
+        """
+        if self.last_keyframe is None:
+            return True
+        if frame.pose is None or self.last_keyframe.pose is None:
+            return False
+
+        n_tracked = frame.n_tracked_points()
+        displacement = float(np.linalg.norm(
+            frame.camera_center() - self.last_keyframe.camera_center()))
+
+        c1 = self.frames_since_keyframe >= self.keyframe_max_frames
+        c2 = displacement > self.keyframe_min_displacement
+        c3 = n_tracked < self.keyframe_min_matches
+
+        return (c1 or c2 or c3) and n_tracked >= 15
+
+    def mark_keyframe(self, frame):
+        self.last_keyframe = frame
+        self.frames_since_keyframe = 0
+
+
+
+
+
 
 
 
