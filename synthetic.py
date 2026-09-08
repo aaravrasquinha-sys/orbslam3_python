@@ -136,6 +136,54 @@ def scroll_sequence(n_frames=120, height=480, width=640, depth_m=2.0,
     return images, depths, gt_poses, cam
 
 
+def two_depth_scroll_sequence(n_frames=60, height=480, width=640,
+                              near_depth_m=1.0, far_depth_m=3.0,
+                              px_per_frame=8, seed=2, fx=385.0, fy=385.0):
+    """
+    PHASE 7: two fronto-parallel textured planes at different depths --
+    top half of the image at near_depth_m, bottom half at far_depth_m --
+    camera translates laterally in front of both, same convention as
+    scroll_sequence. Ground truth translation is calibrated to the NEAR
+    plane; the far plane shows correspondingly less apparent parallax
+    per frame, which is physically correct (a farther plane appears to
+    move less for the same camera translation), not a modeling error.
+
+    WHY THIS EXISTS: scroll_sequence() and yaw_sequence() both use a
+    SINGLE fixed depth for the whole scene, so every point is either
+    all-close or all-far -- neither can exercise local_mapping.py's
+    close/far split (th_depth) or the Phase 7 fix that makes RGB-D mode
+    call _triangulate_new_points for far/no-depth points (see
+    PHASE7_ARCHITECTURE.md finding 3.3 and test_phase7_gate.py's
+    far-point coverage test). With near_depth_m=1.0 and far_depth_m=3.0
+    against the default th_depth=2.0, the top half is unambiguously
+    close and the bottom half is unambiguously far.
+    """
+    rng = np.random.RandomState(seed)
+    half_h = height // 2
+    tex_near = _make_texture(rng, half_h, width + px_per_frame * n_frames)
+    tex_far = _make_texture(rng, height - half_h, width + px_per_frame * n_frames)
+
+    images, depths, gt_poses = [], [], []
+    for i in range(n_frames):
+        img = np.zeros((height, width), np.uint8)
+        img[:half_h] = tex_near[:, i * px_per_frame: i * px_per_frame + width]
+        img[half_h:] = tex_far[:, i * px_per_frame: i * px_per_frame + width]
+        images.append(img)
+
+        depth = np.zeros((height, width), np.uint16)
+        depth[:half_h] = int(near_depth_m * 1000)
+        depth[half_h:] = int(far_depth_m * 1000)
+        depths.append(depth)
+
+        pose = np.eye(4)
+        pose[0, 3] = i * px_per_frame * (near_depth_m / fx)
+        gt_poses.append(pose)
+
+    cam = dict(fx=fx, fy=fy, cx=width / 2, cy=height / 2,
+              width=width, height=height, depth_scale=0.001)
+    return images, depths, gt_poses, cam
+
+
 def yaw_sequence(n_frames=120, height=480, width=640, depth_m=2.0,
                  max_yaw_deg=25.0, seed=1, fx=385.0, fy=385.0):
     """
