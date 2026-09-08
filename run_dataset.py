@@ -96,9 +96,48 @@ def run_dataset(args):
     slam = SLAMSystem(camera, use_depth=not args.mono, verbose=not args.quiet,
                       use_imu=args.imu, config_path=args.config)
 
+    # PHASE 7 (Workstream B): consume the `emitter_on` column record.py
+    # already writes (and camera.py's / record.py's own docstrings already
+    # describe the intent for) but which run_dataset.py previously
+    # ignored entirely. When --ir recording alternates the projector, an
+    # emitter-ON frame has the IR dot pattern painted rigidly onto the
+    # image -- a texture that moves with the CAMERA, not the scene, and
+    # will poison feature matching if extracted from directly. Fix:
+    # extract/track only on emitter-OFF rows; borrow the depth reading
+    # from the nearest emitter-ON neighbor (alternation means one of the
+    # two adjacent rows is always emitter-ON) since only those frames
+    # captured a real structured-light depth pattern. No effect on plain
+    # RGB recordings (no `emitter_on` column at all -> every row processed
+    # exactly as before).
+    has_emitter_col = bool(rows) and "emitter_on" in rows[0] and rows[0]["emitter_on"] != ""
+    emitter_on_flags = None
+    if has_emitter_col:
+        emitter_on_flags = [str(r.get("emitter_on", "")).strip().lower() in ("1", "true")
+                            for r in rows]
+        n_on = sum(emitter_on_flags)
+        print(f"[emitter] manifest has alternating emitter data: "
+             f"{n_on} on-frames / {len(rows) - n_on} off-frames -- "
+             f"tracking will use off-frames only, borrowing depth from "
+             f"the nearest on-frame\n")
+
+    def _nearest_emitter_on_depth_file(i):
+        """Nearest row (by index distance) that is emitter-ON and has a
+        depth_file -- checked in expanding rings since alternation is the
+        common case (distance 1) but isn't guaranteed every row."""
+        for d in range(1, len(rows)):
+            for j in (i - d, i + d):
+                if 0 <= j < len(rows) and emitter_on_flags[j] and rows[j].get("depth_file"):
+                    return rows[j]["depth_file"]
+            if d > 5:   # alternation implies this should resolve almost immediately
+                break
+        return None
+
     t0 = float(rows[0]["timestamp_s"])
     prev_ts = None
     for i, row in enumerate(rows):
+        if emitter_on_flags is not None and emitter_on_flags[i]:
+            continue   # emitter-ON row: depth donor only, never tracked directly
+
         img_path = os.path.join(images_dir, row["image_file"])
         image = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
         if image is None:
@@ -106,9 +145,17 @@ def run_dataset(args):
             continue
 
         depth_image = None
-        if not args.mono and row.get("depth_file"):
-            depth_path = os.path.join(depth_dir, row["depth_file"])
-            depth_image = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+        if not args.mono:
+            depth_file = row.get("depth_file")
+            if emitter_on_flags is not None:
+                # this row is emitter-OFF -- its own depth reading (if
+                # any) was captured without the pattern and is typically
+                # unreliable; prefer the nearest emitter-ON row's depth.
+                donor = _nearest_emitter_on_depth_file(i)
+                depth_file = donor or depth_file
+            if depth_file:
+                depth_path = os.path.join(depth_dir, depth_file)
+                depth_image = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
 
         raw_ts = float(row["timestamp_s"])
         timestamp = raw_ts - t0
