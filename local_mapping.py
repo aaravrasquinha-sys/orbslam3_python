@@ -22,8 +22,9 @@ class LocalMapping:
                  min_parallax_px=2.0, max_neighbors=5,
                  culling_found_ratio=0.25, culling_min_obs=3,
                  max_new_points_per_kf=100,
-                 depth_min=0.3, depth_max=3.5,
+                 depth_min=0.3, depth_max=6.0, th_depth=2.0,
                  depth_patch_radius=2, depth_rel_std_max=0.02,
+                 strat_grid_rows=4, strat_grid_cols=4,
                  kf_culling_redundancy=0.9, kf_culling_min_obs=3,
                  kf_culling_min_map_size=5, kf_culling_protect_recent=3):
         self.camera = camera
@@ -37,13 +38,36 @@ class LocalMapping:
 
         # ORB-SLAM3's rule for RGB-D point creation: cap how many new points
         # a single keyframe can spawn, prioritise the closest (most
-        # reliable) depth, gate to a sane working range, and reject points
-        # sitting on a depth discontinuity (object edges -> flying points).
+        # reliable) depth WITHIN a spatial bucket, gate to a sane working
+        # range, and reject points sitting on a depth discontinuity
+        # (object edges -> flying points).
         self.max_new_points_per_kf = max_new_points_per_kf
         self.depth_min = depth_min
         self.depth_max = depth_max
+        # PHASE 7 (Workstream B): close/far split, ORB-SLAM2's own rule
+        # -- a stereo/RGB-D keypoint is "close" (single-frame depth
+        # trusted) if its depth is under 40x the baseline, else "far"
+        # (needs multi-view triangulation, like a monocular point). At
+        # the D435i's ~5cm IR baseline that's ~2.0m. Points beyond this
+        # were previously created from bare depth anyway (out to the old
+        # depth_max=3.5m) with no reliability distinction, AND anything
+        # beyond depth_max was discarded entirely with no fallback --
+        # meaning the map had NO far-field structure at all. Far points
+        # are what a rotating camera needs to hold onto (they constrain
+        # orientation; close points constrain translation/scale -- see
+        # PHASE7_ARCHITECTURE.md finding 3.3), so this split plus
+        # process_new_keyframe's added triangulation call is the direct
+        # fix for that gap.
+        self.th_depth = th_depth
         self.depth_patch_radius = depth_patch_radius
         self.depth_rel_std_max = depth_rel_std_max
+        # PHASE 7: coarse image grid for stratified point selection (see
+        # _stratified_select) -- replaces pure closest-first, which
+        # clustered the whole per-keyframe budget onto a single nearby
+        # surface (floor, near wall) and left most of the frame with no
+        # coverage at all.
+        self.strat_grid_rows = strat_grid_rows
+        self.strat_grid_cols = strat_grid_cols
 
         # KeyFrameCulling thresholds (LocalMapping::KeyFrameCulling)
         self.kf_culling_redundancy = kf_culling_redundancy
@@ -75,12 +99,29 @@ class LocalMapping:
         self.map.add_keyframe(keyframe)
 
         # 1. link existing observations
+        # PHASE 7 BUGFIX: use add_observation's stale-index return (see
+        # map_point.py) here too, not just in fusion.py. Found via
+        # validate.py: a single ordinary (non-keyframe) tracking pass can
+        # apparently assign the SAME map point to TWO DIFFERENT keypoint
+        # indices in frame.map_point_ids before this frame becomes a
+        # keyframe (root cause not fully isolated to one call site;
+        # this reconciliation step is the natural place to catch it
+        # regardless of which upstream strategy produced it, since every
+        # non-keyframe frame passes through here exactly once, right
+        # before its map_point_ids array is trusted for anything else).
+        # Without this, iterating i in ascending order registers the
+        # LATER index and silently orphans the EARLIER one in exactly
+        # the same way fusion.py's clobbering did.
         for i, mp_id in enumerate(keyframe.map_point_ids):
             if mp_id is None:
                 continue
             mp = self.map.map_points.get(mp_id)
             if mp and not mp.is_bad:
-                mp.add_observation(keyframe.id, i)
+                stale_idx = mp.add_observation(keyframe.id, i)
+                if (stale_idx is not None and stale_idx != i
+                        and 0 <= stale_idx < len(keyframe.map_point_ids)
+                        and keyframe.map_point_ids[stale_idx] == mp.id):
+                    keyframe.map_point_ids[stale_idx] = None
 
         # 2. cull unreliable recently-created points
         n_culled = self.cull_recent_map_points(keyframe)
@@ -88,6 +129,17 @@ class LocalMapping:
         # 3. create new points
         if use_depth:
             new_points = self._create_points_from_depth(keyframe, depth_image=depth_image)
+            # PHASE 7 (Workstream B): also multi-view-triangulate whatever
+            # is STILL unmatched after close-point creation -- i.e. far
+            # points (depth > th_depth) and points with no valid depth
+            # reading at all. RGB-D mode previously never called this at
+            # all, so the map had zero far-field structure; see this
+            # class's __init__ docstring and PHASE7_ARCHITECTURE.md
+            # finding 3.3 for why that's the direct cause of losing
+            # tracking under rotation. _triangulate_new_points only
+            # operates on keypoints whose map_point_ids entry is still
+            # None, so this is naturally additive, not a re-scan.
+            new_points += self._triangulate_new_points(keyframe)
         else:
             new_points = self._triangulate_new_points(keyframe)
 
@@ -200,7 +252,7 @@ class LocalMapping:
         neighbors. The most recent few keyframes stay protected.
         """
         if self.map.n_keyframes() < self.kf_culling_min_map_size:
-            return 0
+            return 0, []
 
         ordered = sorted((kf for kf in self.map.keyframes if kf.kf_seq is not None),
                          key=lambda kf: kf.kf_seq)
@@ -261,12 +313,21 @@ class LocalMapping:
         if to_cull:
             self.map.clean_bad_points()
             covisibility.build_covisibility_graph(self.map, graph=self.covis_graph)
-        return len(to_cull)
+        # Phase 5: return the actual culled ids too, not just the count --
+        # run_slam.py needs these to clean up keyframe_database.py's
+        # inverted index (otherwise it accumulates dangling entries
+        # pointing at keyframes no longer in any live Map).
+        return len(to_cull), [kf.id for kf in to_cull]
 
     def _create_points_from_depth(self, keyframe, depth_image=None):
         """
-        Depth available: unproject unmatched keypoints directly. No parallax
-        needed.
+        Depth available: unproject unmatched CLOSE keypoints directly
+        (depth <= th_depth). No parallax needed -- single-frame depth is
+        trusted at this range. Far points (depth > th_depth, up to
+        depth_max) and points with no valid depth are deliberately left
+        for _triangulate_new_points instead (see process_new_keyframe) --
+        see this class's __init__ docstring for the ORB-SLAM2 close/far
+        rule this follows.
 
         Was previously unbounded -- ~1000 new points created per keyframe,
         forever, with no fusion against existing points (SearchInNeighbors
@@ -279,28 +340,27 @@ class LocalMapping:
         rank-deficient null space.
 
         Fix, following ORB-SLAM3's own rule: cap new points per keyframe,
-        create closest-depth-first, gate to a working depth range, and
-        reject points sitting on a depth discontinuity (a median/std check
-        over a small patch -- this is what kills "flying points" at object
-        edges, the classic RGB-D artifact).
+        select with spatial stratification (see _stratified_select --
+        PHASE 7, replaces pure closest-first), gate to a working depth
+        range, and reject points sitting on a depth discontinuity (a
+        median/std check over a small patch -- this is what kills "flying
+        points" at object edges, the classic RGB-D artifact).
         """
         candidates = []
         for i in range(keyframe.n):
             if keyframe.map_point_ids[i] is not None:
                 continue
             z = keyframe.depths[i]
-            if z <= 0 or z < self.depth_min or z > self.depth_max:
+            if z <= 0 or z < self.depth_min or z > self.th_depth:
                 continue
             if depth_image is not None and not self._depth_patch_ok(keyframe, depth_image, i, z):
                 continue
             candidates.append((z, i))
 
-        # closest first -- nearer depth is more reliable on this sensor
-        candidates.sort(key=lambda t: t[0])
-        candidates = candidates[:self.max_new_points_per_kf]
+        selected = self._stratified_select(candidates, keyframe)
 
         new_points = []
-        for _, i in candidates:
+        for _, i in selected:
             p3d = keyframe.unproject_keypoint(i)
             if p3d is None:
                 continue
@@ -309,6 +369,53 @@ class LocalMapping:
             keyframe.map_point_ids[i] = mp.id
             new_points.append(mp)
         return new_points
+
+    def _stratified_select(self, candidates, keyframe):
+        """
+        PHASE 7 (Workstream B): bucket `candidates` (list of (depth,
+        kp_idx) tuples) into a coarse strat_grid_rows x strat_grid_cols
+        grid over the image, then round-robin across buckets -- taking
+        the closest (most reliable) depth WITHIN a bucket first -- until
+        max_new_points_per_kf is reached or candidates run out.
+
+        WHY: pure closest-first (the original rule) sorts globally by
+        depth and takes the top N, which in practice means the ENTIRE
+        per-keyframe point budget lands on whichever single surface is
+        nearest the camera -- typically the floor or one near wall.
+        Everywhere else in the frame gets zero new points, keyframe
+        after keyframe. Round-robin across spatial buckets spreads the
+        same budget across the whole image instead, without giving up
+        the within-bucket reliability preference for nearer depth.
+        """
+        if not candidates:
+            return []
+        h, w = keyframe.image_shape if keyframe.image_shape else (480, 640)
+        rows, cols = max(1, self.strat_grid_rows), max(1, self.strat_grid_cols)
+
+        buckets = {}
+        for z, i in candidates:
+            kp = keyframe.keypoints[i]
+            col = min(cols - 1, max(0, int(kp.pt[0] / max(w, 1) * cols)))
+            row = min(rows - 1, max(0, int(kp.pt[1] / max(h, 1) * rows)))
+            buckets.setdefault((row, col), []).append((z, i))
+        for key in buckets:
+            buckets[key].sort(key=lambda t: t[0])   # closest first WITHIN a bucket
+
+        selected = []
+        ptrs = {key: 0 for key in buckets}
+        keys = list(buckets.keys())
+        while len(selected) < self.max_new_points_per_kf:
+            progressed = False
+            for key in keys:
+                if ptrs[key] < len(buckets[key]):
+                    selected.append(buckets[key][ptrs[key]])
+                    ptrs[key] += 1
+                    progressed = True
+                    if len(selected) >= self.max_new_points_per_kf:
+                        break
+            if not progressed:
+                break
+        return selected
 
     def _depth_patch_ok(self, keyframe, depth_image, kp_idx, center_depth):
         """
@@ -389,7 +496,37 @@ class LocalMapping:
 
                 ci = cur_unmatched[m.queryIdx]
                 ni = neigh_unmatched[m.trainIdx]
-                if keyframe.map_point_ids[ci] is not None:
+                # PHASE 7 BUGFIX: found via validate.py surfacing 422
+                # dangling-reference errors (93.5% reference validity,
+                # below the 99% gate) on a run that only exercises THIS
+                # function -- a bug that predates Phase 7 but was never
+                # triggered in RGB-D mode before this phase started
+                # calling it there (see process_new_keyframe). cv2's
+                # BFMatcher.match() guarantees a unique queryIdx per
+                # call (so `ci` values here are naturally unique), but
+                # makes NO such guarantee on trainIdx -- several
+                # different `ci` can legitimately match to the SAME
+                # `ni` if that neighbor descriptor happens to be the
+                # closest match for more than one query descriptor
+                # (common with the repeated-rectangle synthetic
+                # texture, and plausible on any real repetitive
+                # surface). Without this check, a second match to the
+                # same `ni` OVERWRITES neigh.map_point_ids[ni] with a
+                # brand-new MapPoint, silently orphaning the FIRST
+                # point's claim that neigh observes it at `ni` (that
+                # point's own .observations dict still says so, but
+                # neigh no longer corroborates it) -- and when that
+                # first, now-orphaned point is later deleted (culling /
+                # fusion), map.py's cleanup walks ITS OWN observations
+                # dict and clears neigh.map_point_ids[ni], which by
+                # then holds a DIFFERENT, still-valid point's id,
+                # producing exactly the "keyframe references a
+                # nonexistent point" symptom validate.py caught. Fixed
+                # the same way the `ci` side was already guarded:
+                # first match to a given (keyframe, neighbor) keypoint
+                # pair wins, any later duplicate is skipped entirely
+                # rather than created-then-clobbered.
+                if keyframe.map_point_ids[ci] is not None or neigh.map_point_ids[ni] is not None:
                     continue
 
                 mp = MapPoint(p, keyframe.descriptors[ci], ref_keyframe_id=keyframe.kf_seq)
