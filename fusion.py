@@ -60,10 +60,44 @@ def _fuse_point(world_map, keep_id, absorb_id, kf_by_id):
         keep, absorb = absorb, keep
 
     for kf_id, kp_idx in list(absorb.observations.items()):
-        keep.add_observation(kf_id, kp_idx)
+        # PHASE 7 BUGFIX: `keep` may ALREADY observe this same kf_id at
+        # a DIFFERENT keypoint index (both points can be independently
+        # detected from the same keyframe before being fused) -- see
+        # map_point.py's add_observation docstring for the full
+        # mechanism. Must clear that stale slot or it dangles forever
+        # once `keep` is eventually deleted (its own .observations will
+        # only remember the NEW index by then).
+        stale_idx = keep.add_observation(kf_id, kp_idx)
         kf = kf_by_id.get(kf_id)
-        if kf is not None and 0 <= kp_idx < len(kf.map_point_ids):
-            kf.map_point_ids[kp_idx] = keep.id
+        if kf is not None:
+            if (stale_idx is not None and 0 <= stale_idx < len(kf.map_point_ids)
+                    and kf.map_point_ids[stale_idx] == keep.id):
+                kf.map_point_ids[stale_idx] = None
+            if 0 <= kp_idx < len(kf.map_point_ids):
+                kf.map_point_ids[kp_idx] = keep.id
+    # PHASE 7 BUGFIX: found via validate.py surfacing 503 "observations
+    # references a frame that isn't a live keyframe anywhere" errors
+    # (check_observations_are_keyframes) on a run that forces heavy
+    # fusion + relocalization-disabled fragmentation. Root cause: this
+    # loop redirects every keyframe absorb used to observe over to
+    # `keep` (correct, above) but never cleared absorb.observations
+    # ITSELF -- so absorb's dict kept the OLD, now-superseded entries.
+    # Moments later, search_in_neighbors() calls clean_bad_points() on
+    # this now-is_bad point, which walks absorb.observations (still
+    # full of stale entries) and blindly nulls kf.map_point_ids[kp_idx]
+    # for each one -- WIPING OUT the correct redirect this loop just
+    # made to `keep`, moments after making it. keep's own .observations
+    # dict still (correctly) claims that keyframe, but the keyframe's
+    # own array no longer agrees -- and once that keyframe is later
+    # culled, cull_keyframes() only walks map_point_ids (which no
+    # longer lists keep there) to decide what to clean up, so keep's
+    # now-orphaned claim survives forever. Clearing absorb's own dict
+    # here, immediately after redirecting each entry, is the direct fix
+    # -- and map.py's clean_bad_points/erase_map_point also got a
+    # defensive ownership check (only clear a slot if it still points
+    # at the point actually being deleted) as a second, independent
+    # layer against this same failure shape recurring elsewhere.
+    absorb.observations.clear()
     keep.increase_visible(absorb.n_visible)
     keep.increase_found(absorb.n_found)
     absorb.set_bad()
@@ -115,6 +149,32 @@ def _project_and_fuse(src_points, target_kf, world_map, camera,
             survivor = _fuse_point(world_map, keep_id=mp.id, absorb_id=existing_id,
                                    kf_by_id=kf_by_id)
             if survivor is not None:
+                # BUGFIX (found during Phase 6 verification -- see
+                # map.py's own bugfix comment for the sibling half of
+                # this issue): _fuse_point's internal redirect loop only
+                # updates keyframes found in absorb.observations. But
+                # target_kf's own connection to `existing_id` (=absorb)
+                # was established via THIS line's map_point_ids
+                # assignment -- if THAT prior assignment ever happened
+                # through a path that itself skipped add_observation
+                # (confirmed: tracking.py's _track_local_map and
+                # _solve_pnp both did, before their own fix below),
+                # target_kf would never have been in absorb.observations
+                # to begin with, so _fuse_point's loop silently never
+                # sees it. Unconditionally registering it here as well
+                # closes that gap regardless of how the original
+                # assignment happened -- add_observation is a plain dict
+                # assignment (self.observations[frame_id]=kp_idx),
+                # naturally idempotent, so this is always safe to call.
+                survivor_mp = world_map.map_points.get(survivor)
+                if survivor_mp is not None:
+                    # PHASE 7 BUGFIX: same mechanism as _fuse_point above
+                    # -- survivor_mp may already observe target_kf at a
+                    # different index.
+                    stale_idx = survivor_mp.add_observation(target_kf.id, best_idx)
+                    if (stale_idx is not None and 0 <= stale_idx < len(target_kf.map_point_ids)
+                            and target_kf.map_point_ids[stale_idx] == survivor):
+                        target_kf.map_point_ids[stale_idx] = None
                 target_kf.map_point_ids[best_idx] = survivor
                 n_events += 1
     return n_events
