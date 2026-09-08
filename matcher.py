@@ -55,6 +55,47 @@ class Matcher:
         matches = [m for m in matches if m.distance <= self.max_distance]
         return sorted(matches, key=lambda m: m.distance)
 
+    @staticmethod
+    def dedupe_by_train_idx(matches):
+        """
+        PHASE 7 BUGFIX: keep only the first (best -- callers pass matches
+        already sorted best-distance-first, which match()/match_ratio()
+        both already do) match per trainIdx.
+
+        A one-directional match (BFMatcher.match() or knnMatch, which
+        match_ratio() wraps) guarantees a unique queryIdx per call but
+        makes NO such guarantee on trainIdx -- several different query
+        descriptors can legitimately have the SAME train descriptor as
+        their independent single best match. Left un-deduplicated, a
+        caller that does `frame.map_point_ids[m.queryIdx] = mp_id` per
+        match can end up giving the SAME map point TWO DIFFERENT
+        keypoint indices in one frame (both can independently pass
+        RANSAC as geometric inliers, since a real 3D point can
+        genuinely be close to more than one candidate keypoint under
+        descriptor noise). That corrupts the reference-integrity
+        invariants validate.py checks: whichever code registers that
+        frame's observation LATER silently orphans the EARLIER index
+        from the map point's own .observations bookkeeping (see
+        map_point.py's add_observation docstring for the exact
+        mechanism) -- found via validate.py surfacing a 93.5% reference-
+        validity rate (should be >99%) on a plain synthetic run with no
+        loss, fragmentation, or merging at all; traced to this exact
+        root cause in tracking.py's _solve_pnp. Applied at every site
+        that matches AGAINST an existing map/frame (tracking.py's
+        _solve_pnp, relocalization.py's try_relocalize, initializer.py's
+        init_monocular) -- _triangulate_new_points in local_mapping.py
+        has an equivalent inline guard instead since it also needs to
+        check the CURRENT keyframe's own already-matched slots in the
+        same pass.
+        """
+        seen, deduped = set(), []
+        for m in matches:
+            if m.trainIdx in seen:
+                continue
+            seen.add(m.trainIdx)
+            deduped.append(m)
+        return deduped
+
     def match_ratio(self, desc_a, desc_b):
         """
         Lowe's ratio test variant — closer to ORBmatcher's mfNNratio logic.
@@ -146,3 +187,4 @@ if __name__ == "__main__":
         disp = np.linalg.norm(pa - pb, axis=1)
         print(f"mean pixel displacement: {disp.mean():.2f} px "
               f"(low value = low parallax = bad for triangulation)")
+      
