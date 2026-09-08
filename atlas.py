@@ -30,6 +30,35 @@ class Atlas:
         self.maps.append(new_map)
         return new_map
 
+    def switch_active_map(self, target_map):
+        """
+        Phase 5: relocalization support. Unlike start_new_map(), this
+        RESUMES an existing map instead of abandoning it -- the direct
+        fix for the original "camera returns to a place the loop
+        detector never even looks at" failure mode (the old loop closer
+        only ever searched self.map.keyframes, i.e. the currently active
+        map; see loop_closing.py). Moves target_map to the end of the
+        list (active_map is always self.maps[-1]) rather than mutating
+        map identity, so any code elsewhere holding a reference to a Map
+        object stays valid.
+        """
+        if target_map not in self.maps:
+            raise ValueError("switch_active_map: target_map is not in this Atlas")
+        self.active_map.is_active = False
+        self.maps.remove(target_map)
+        self.maps.append(target_map)
+        target_map.is_active = True
+        return target_map
+
+    def map_containing_keyframe(self, kf_id):
+        """Phase 5: which map (if any) currently holds this keyframe id --
+        needed after a keyframe-database query returns a candidate, since
+        the candidate could belong to ANY map, not just the active one."""
+        for m in self.maps:
+            if any(kf.id == kf_id for kf in m.keyframes):
+                return m
+        return None
+
     def n_maps(self):
         return len(self.maps)
 
