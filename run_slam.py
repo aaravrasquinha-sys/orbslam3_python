@@ -34,7 +34,11 @@ from frame import Frame
 from atlas import Atlas
 from tracking import Tracking
 from local_mapping import LocalMapping
-from vocabulary import Vocabulary
+from orb_vocabulary import ORBVocabulary
+from keyframe_database import KeyFrameDatabase
+import relocalization
+import pose_graph
+import merge_maps
 from loop_closing import LoopClosing
 import initializer
 from bundle_adjust import local_bundle_adjust, local_inertial_bundle_adjust, pose_only_optimize
@@ -79,8 +83,21 @@ class SLAMSystem:
         # PLACE (see covisibility.py) after every keyframe, so Tracking
         # always sees the latest version through this one reference.
         self.tracking.covis_graph = self.local_mapping.covis_graph
-        self.vocab = Vocabulary(n_words=self.cfg["loop_closing"]["vocab_words"])
+        # Phase 5: real ORBvoc-format vocabulary replaces the KMeans
+        # placeholder entirely -- see orb_vocabulary.py's module docstring
+        # for why, and setup_vocabulary.py for the one-time fetch script.
+        # Loading is NOT wrapped in a silent try/except: a facility-
+        # mapping run without a real vocabulary (BoW is an explicit hard
+        # requirement for this project) should fail loudly and tell the
+        # person exactly what to run, not silently degrade to something
+        # worse. If you deliberately want to run without it for a quick
+        # test, catch FileNotFoundError yourself around SLAMSystem(...).
+        self.vocab = ORBVocabulary()
+        self.vocab.load()
+        self.keyframe_db = KeyFrameDatabase(self.vocab)
         self.loop_closer = LoopClosing(camera, self.matcher, self.vocab,
+                                       keyframe_db=self.keyframe_db,
+                                       atlas=self.atlas,
                                        min_keyframe_gap=self.cfg["loop_closing"]["min_keyframe_gap"],
                                        consistency_checks=self.cfg["loop_closing"]["consistency_checks"])
 
@@ -103,7 +120,7 @@ class SLAMSystem:
         self.stats = {'tracked': 0, 'lost': 0, 'keyframes': 0,
                       'points_created': 0, 'points_culled': 0, 'loops': 0,
                       'points_fused': 0, 'keyframes_culled': 0,
-                      'imu_init_attempts': 0}
+                      'imu_init_attempts': 0, 'relocalizations': 0}
 
     def process(self, image, timestamp, depth_image=None, imu_samples=None):
         """
@@ -142,6 +159,7 @@ class SLAMSystem:
                     self.stats['keyframes'] += 1
                     self.stats['points_created'] += len(new_pts)
                     self.last_ok_timestamp = timestamp
+                    self.keyframe_db.add_keyframe(frame)   # Phase 5
                     if self.use_imu:
                         self._start_imu_segment()
                     self._log(f"[init] RGB-D success at frame {frame.id} "
@@ -163,6 +181,8 @@ class SLAMSystem:
                     self.stats['keyframes'] += 2
                     self.stats['points_created'] += len(new_pts)
                     self.last_ok_timestamp = timestamp
+                    self.keyframe_db.add_keyframe(self.init_candidate)   # Phase 5
+                    self.keyframe_db.add_keyframe(frame)                 # Phase 5
                     if self.use_imu:
                         self._start_imu_segment()
                     self._log(f"[init] mono success at frame {frame.id} "
@@ -197,6 +217,40 @@ class SLAMSystem:
             else:
                 give_up = self.consecutive_lost >= 10
 
+            # Phase 5: attempt relocalization BEFORE giving up. This is
+            # the direct fix for the original "no Relocalization()"
+            # gap flagged from this project's very first forensic pass --
+            # every sustained tracking loss used to permanently fragment
+            # the Atlas with zero recovery attempt. Tried on every LOST
+            # frame, not just once give_up triggers: a successful match
+            # here means we never fragment in the first place, whether
+            # the recognized place is in the CURRENTLY active map (no
+            # fragmentation ever happens) or an older, already-abandoned
+            # one (Atlas resumes it instead of starting yet another
+            # fragment -- see relocalization.py's docstring for why this
+            # switches maps rather than attempting a full merge, which is
+            # real, separate work deferred to Phase 6).
+            exclude_ids = {self.tracking.last_keyframe.id} if self.tracking.last_keyframe else None
+            relocalized, matched_map = relocalization.try_relocalize(
+                frame, self.keyframe_db, self.atlas, self.camera, self.matcher,
+                min_inliers=self.cfg["relocalization"]["min_inliers"],
+                top_n_candidates=self.cfg["relocalization"]["top_n_candidates"],
+                exclude_ids=exclude_ids)
+
+            if relocalized:
+                self._log(f"[reloc] recovered at frame {frame.id} into "
+                          f"map {matched_map.id} after {self.consecutive_lost} lost frames")
+                self.tracking.set_map(matched_map)
+                self.local_mapping.set_map(matched_map)
+                self.tracking.covis_graph = self.local_mapping.covis_graph
+                self.tracking.state = "OK"
+                self.tracking.last_frame = frame
+                self.tracking.velocity = None   # motion model has no basis to trust yet
+                self.consecutive_lost = 0
+                self.last_ok_timestamp = timestamp
+                self.stats['relocalizations'] = self.stats.get('relocalizations', 0) + 1
+                return frame
+
             if give_up:
                 self._log(f"[atlas] starting NEW MAP after "
                           f"{self.consecutive_lost} lost frames ({elapsed_lost:.2f}s)")
@@ -227,6 +281,7 @@ class SLAMSystem:
             self.stats['points_created'] += len(new_pts)
             self.stats['points_culled'] += n_culled
             self.stats['points_fused'] += n_fused
+            self.keyframe_db.add_keyframe(frame)   # Phase 5
 
             if self.use_imu:
                 self._finalize_imu_segment(frame)
@@ -245,8 +300,10 @@ class SLAMSystem:
             # concatenating preintegration segments across a cull, which
             # is real work deferred for now -- see PROGRESS notes.
             if not self.use_imu:
-                n_kf_culled = self.local_mapping.cull_keyframes()
+                n_kf_culled, culled_ids = self.local_mapping.cull_keyframes()
                 self.stats['keyframes_culled'] += n_kf_culled
+                for kf_id in culled_ids:   # Phase 5: keep the inverted index consistent
+                    self.keyframe_db.remove_keyframe(kf_id)
 
             # Re-enabled: the old dense/unbounded BA is what was hanging.
             # bundle_adjust.py now uses a bounded window, a sparse
@@ -290,19 +347,28 @@ class SLAMSystem:
                                         verbose=self.verbose)
 
             # ── loop closing ─────────────────────────────────────────────
+            # Phase 6: loop closing is now Atlas-wide (keyframe_database.py)
+            # with 3D-3D geometric verification (loop_verification.py),
+            # and a confirmed loop is ACTUALLY CORRECTED, not just logged
+            # -- the "NOT corrected" era ends here. Two distinct cases,
+            # branched on whether the matched keyframe is in the SAME map
+            # (intra-map: pose_graph.py redistributes the loop error
+            # across the path) or a DIFFERENT, previously-fragmented map
+            # (cross-map: merge_maps.py actually folds it back in, which
+            # relocalization.py's map-switching alone never did).
+            #
+            # Extracted into _handle_loop_result() (see below) rather than
+            # inlined here: test_phase6_gate.py's end-to-end test needs to
+            # invoke this exact logic directly, independent of whether the
+            # n_kf%10==0 cadence happens to land on the right keyframe in
+            # a finite synthetic sequence -- the cadence itself is a
+            # legitimate production design choice (bounding how often an
+            # expensive Atlas-wide check runs), not something a
+            # correctness test should be at the mercy of.
             if n_kf % 10 == 0 and n_kf >= 20:
-                descs = [kf.descriptors for kf in world_map.keyframes
-                         if kf.descriptors is not None and len(kf.descriptors) > 0]
-                if descs:
-                    self.vocab.build(np.vstack(descs))
                 result = self.loop_closer.detect_loop(frame, world_map)
                 if result is not None:
-                    matched_kf, sim, inliers = result
-                    drift = self.loop_closer.measure_drift(frame, matched_kf)
-                    self.stats['loops'] += 1
-                    self._log(f"[LOOP] kf {frame.id} <-> kf {matched_kf.id} | "
-                              f"sim={sim:.3f} inliers={inliers} | "
-                              f"drift={drift:.3f}m (NOT corrected)")
+                    world_map = self._handle_loop_result(frame, world_map, result)
         return frame
 
     # ── IMU orchestration (Phase 3/4) ───────────────────────────────────
@@ -342,7 +408,69 @@ class SLAMSystem:
         keyframe.bias_accel = self.bias_accel.copy()
         self._start_imu_segment()
 
-    def _try_imu_init(self, world_map):
+    def _handle_loop_result(self, frame, world_map, result):
+        """
+        Phase 6: apply a CONFIRMED loop-closure result -- either intra-map
+        pose-graph correction or cross-map merging. Extracted from
+        process()'s inline loop-closing block specifically so
+        test_phase6_gate.py can invoke this exact logic directly,
+        independent of whether the production n_kf%10==0 cadence happens
+        to land on the right keyframe within a finite synthetic test
+        sequence (see that file's test_end_to_end_merge for the full
+        reasoning). Returns the (possibly updated, if a merge happened)
+        world_map -- callers MUST use the returned value, not assume the
+        one they passed in is still current.
+        """
+        matched_kf, matched_map, sim, inliers, R, t, s = result
+        drift = self.loop_closer.measure_drift(frame, matched_kf)
+        self.stats['loops'] += 1
+
+        if matched_map is world_map:
+            loop_edge = pose_graph.compute_loop_edge(
+                frame, matched_kf, self.matcher, self.camera, world_map)
+            if loop_edge is not None:
+                T_rel, n_pnp_inliers = loop_edge
+                pg_stats = pose_graph.optimize_pose_graph(
+                    world_map, frame, matched_kf, T_rel,
+                    loop_weight=min(100.0, n_pnp_inliers),
+                    camera=self.camera, covis_graph=self.local_mapping.covis_graph,
+                    extractor=self.extractor, verbose=self.verbose)
+                self._log(f"[LOOP] kf {frame.id} <-> kf {matched_kf.id} "
+                          f"(same map) | sim={sim:.3f} inliers={inliers} | "
+                          f"drift={drift:.3f}m -> CORRECTED "
+                          f"({pg_stats['n_keyframes_corrected'] if pg_stats else 0} kfs, "
+                          f"{pg_stats['n_points_corrected'] if pg_stats else 0} pts)")
+            else:
+                self._log(f"[LOOP] kf {frame.id} <-> kf {matched_kf.id} "
+                          f"(same map) | drift={drift:.3f}m -> correction "
+                          f"attempted but compute_loop_edge found too few "
+                          f"inliers, skipped")
+            return world_map
+
+        merge_stats = merge_maps.merge_maps(
+            self.atlas, matched_map, world_map, R, t, s,
+            anchor_kf_a=frame, anchor_kf_b=matched_kf,
+            camera=self.camera, matcher=self.matcher,
+            extractor=self.extractor,
+            covis_graph=self.local_mapping.covis_graph,
+            verbose=self.verbose)
+        # world_map (the just-absorbed fragment) no longer exists as a
+        # separate map -- everything downstream of this point needs to
+        # operate on matched_map, the survivor. Mirrors relocalization.py's
+        # own post-switch bookkeeping exactly.
+        world_map = matched_map
+        self.tracking.set_map(world_map)
+        self.local_mapping.set_map(world_map)
+        self.tracking.covis_graph = self.local_mapping.covis_graph
+        self._log(f"[LOOP] kf {frame.id} <-> kf {matched_kf.id} "
+                  f"(CROSS-MAP) | sim={sim:.3f} inliers={inliers} | "
+                  f"drift={drift:.3f}m -> MERGED "
+                  f"({merge_stats['n_keyframes_after']} kfs, "
+                  f"{merge_stats['n_points_after']} pts, "
+                  f"scale={merge_stats['scale_applied']:.3f})")
+        return world_map
+
+
         """
         Attempt staged inertial initialization (imu_init.py) once enough
         keyframes with attached preintegration segments exist. On success,
