@@ -33,7 +33,8 @@ class Tracking:
                  min_matches_for_pose=15,
                  keyframe_min_matches=50,
                  keyframe_min_displacement=0.10,
-                 keyframe_max_frames=20):
+                 keyframe_max_frames=20,
+                 keyframe_min_rotation_deg=15.0):
         self.camera = camera
         self.extractor = extractor
         self.matcher = matcher
@@ -62,6 +63,16 @@ class Tracking:
         self.keyframe_min_matches = keyframe_min_matches
         self.keyframe_min_displacement = keyframe_min_displacement
         self.keyframe_max_frames = keyframe_max_frames
+        # PHASE 7 (Workstream B): a keyframe used to be triggered only by
+        # translation, frame count, or a drop in tracked-point count. A
+        # PURE rotation (the exact motion that collapses tracking --
+        # see PHASE7_ARCHITECTURE.md finding 3.3) produces near-zero
+        # translation and therefore used to trigger NO keyframe at all,
+        # so the map never gained coverage for the very motion that most
+        # needed it. ORB-SLAM2 has an equivalent close-point-ratio
+        # trigger; this project's simpler analogue is a direct rotation
+        # magnitude check against the last keyframe.
+        self.keyframe_min_rotation_deg = keyframe_min_rotation_deg
 
     def set_map(self, world_map):
         """Called when Atlas switches to a new active map."""
@@ -105,6 +116,23 @@ class Tracking:
         # Strategy 2: fall back to matching against the local map
         if not ok:
             ok = self._track_reference_keyframe(frame)
+
+        # NOTE (Phase 7): Strategy 3, the dense RGB-D alignment fallback
+        # (dense_odometry.py, Phase 4), was REMOVED this phase per an
+        # explicit decision: it never worked reliably on real hardware
+        # (see the handoff conversation), added an Open3D dependency,
+        # and its purpose -- surviving a genuinely textureless surface --
+        # is now substantially addressed at the front-end level instead:
+        # far-point triangulation (local_mapping.py, Workstream B) keeps
+        # SOME map coverage alive during rotation even when close/sparse
+        # features are scarce, and the rotation-triggered keyframe
+        # criterion above means a low-texture stretch gets more chances
+        # to accumulate whatever sparse features it does have. If a
+        # genuinely featureless facility area turns out to still be a
+        # real problem after those fixes are hardware-verified, the
+        # right replacement is a cheap frame-to-frame optical-flow
+        # tracker (much lower overhead than Open3D dense alignment,
+        # more real-time-friendly), not resurrecting dense_odometry.py.
 
         if ok:
             # TrackLocalMap: now that we have an initial pose, expand
@@ -278,6 +306,39 @@ class Tracking:
             if best_idx < 0 or best_dist > TH_LOW:
                 continue
 
+            # BUGFIX HISTORY: Phase 6 added mp.add_observation(frame.id,
+            # best_idx) here, believing its absence was the cause of the
+            # stale-reference bug it was chasing. That diagnosis was
+            # half right and the fix over-corrected: `track()` is called
+            # for EVERY frame, not just keyframes, so calling
+            # add_observation() here registered every ordinary tracked
+            # frame -- not just keyframes -- into MapPoint.observations.
+            # Every consumer of .observations (bundle_adjust_gtsam.py,
+            # covisibility.py, fusion.py, local_mapping.py's culling,
+            # pose_graph.py) assumes it holds KEYFRAME ids only -- see
+            # map_point.py's own module docstring. Polluting it with
+            # ordinary frame ids inflates n_observations() (silent
+            # UNDER-culling, the mirror image of the original 81%
+            # OVER-culling bug) and breaks pose_graph.py's
+            # `ref_kf_id = min(mp.observations.keys())` lookup whenever
+            # the minimum id happens to be a non-keyframe frame -- that
+            # point is then silently skipped during loop-closure
+            # correction (see PHASE7_ARCHITECTURE.md finding 3.1).
+            #
+            # PHASE 7 FIX: removed. frame.map_point_ids[i] and
+            # increase_found()/increase_visible() are the correct,
+            # complete bookkeeping for a non-keyframe tracked frame --
+            # they drive found-ratio culling and "already tracked this
+            # frame" bookkeeping, neither of which needs .observations.
+            # If this frame LATER becomes a keyframe,
+            # local_mapping.process_new_keyframe's "link existing
+            # observations" step (step 1) unconditionally registers
+            # every entry in map_point_ids into mp.observations at that
+            # point -- which is the correct, single place this
+            # registration should happen. validate.py's
+            # check_observations_are_keyframes() enforces this
+            # invariant going forward so this bug family can't recur
+            # silently.
             frame.map_point_ids[best_idx] = mp.id
             mp.increase_found()
             already_tracked.add(mp.id)
@@ -324,6 +385,7 @@ class Tracking:
         # initializer.py for where this technique IS correctly applicable
         # (genuine frame-vs-frame matching, both sides real keypoints).
         matches = self.matcher.match_ratio(frame.descriptors, mp_descs)
+        matches = self.matcher.dedupe_by_train_idx(matches)   # PHASE 7 BUGFIX -- see matcher.py
         if len(matches) < self.min_matches_for_pose:
             return False
 
@@ -372,7 +434,13 @@ class Tracking:
         T_wc[:3, 3] = tvec.flatten()
         frame.set_pose(np.linalg.inv(T_wc))
 
-        # Record only the inlier associations
+        # Record only the inlier associations.
+        # PHASE 7 FIX: see the sibling fix in _track_local_map above for
+        # the full account -- add_observation() was added here in Phase
+        # 6 and removed in Phase 7, because _solve_pnp runs on every
+        # tracked frame (not just keyframes) and .observations must stay
+        # keyframe-only. map_point_ids + increase_found() is the correct,
+        # complete bookkeeping for a non-keyframe frame.
         inlier_set = set(int(i) for i in inliers.flatten())
         for k, (kp_i, mp_id) in enumerate(zip(kp_indices, matched_mp_ids)):
             if k in inlier_set:
@@ -400,11 +468,25 @@ class Tracking:
         displacement = float(np.linalg.norm(
             frame.camera_center() - self.last_keyframe.camera_center()))
 
+        # PHASE 7: rotation criterion. Relative rotation between this
+        # frame and the last keyframe, via the same log_so3 the project
+        # already uses for pose-graph residuals (imu.py) -- angle is the
+        # norm of the rotation vector. A pure yaw/pitch/roll with near-
+        # zero translation used to trip NONE of c1-c3 until
+        # keyframe_max_frames frames had passed, by which point the
+        # camera could have already rotated past everything the map held
+        # (see PHASE7_ARCHITECTURE.md finding 3.3 -- this is directly
+        # why rotation was losing tracking).
+        from imu import log_so3
+        R_rel = self.last_keyframe.pose[:3, :3].T @ frame.pose[:3, :3]
+        rotation_deg = float(np.degrees(np.linalg.norm(log_so3(R_rel))))
+
         c1 = self.frames_since_keyframe >= self.keyframe_max_frames
         c2 = displacement > self.keyframe_min_displacement
         c3 = n_tracked < self.keyframe_min_matches
+        c4 = rotation_deg > self.keyframe_min_rotation_deg
 
-        return (c1 or c2 or c3) and n_tracked >= 15
+        return (c1 or c2 or c3 or c4) and n_tracked >= 15
 
     def mark_keyframe(self, frame):
         self.last_keyframe = frame
