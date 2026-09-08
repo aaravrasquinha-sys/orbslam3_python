@@ -96,7 +96,32 @@ class MapPoint:
             self.min_distance = self.max_distance / max_scale
 
     def add_observation(self, frame_id, keypoint_idx):
+        """
+        PHASE 7: returns the PREVIOUS keypoint_idx this point was
+        registered at for this same frame_id, or None if this frame_id
+        wasn't already observing this point (the common case).
+
+        WHY THIS MATTERS: observations is a plain dict keyed by
+        frame_id, so re-registering an already-observing frame_id at a
+        DIFFERENT keypoint_idx silently overwrites the old entry here --
+        but the corresponding keyframe-side kf.map_point_ids[old_idx]
+        does NOT get cleared automatically, because clearing it requires
+        the actual Frame object, which this method doesn't have. Found
+        via validate.py: fusion.py's point-merging is the one place this
+        genuinely happens (the SAME physical point can be independently
+        detected at two different keypoint indices in the SAME keyframe
+        before the two candidate MapPoints are fused into one), and
+        without using this return value, the orphaned OLD index stays
+        live in kf.map_point_ids until that MapPoint is eventually
+        deleted -- at which point cleanup only knows about the NEW
+        index (since that's all this dict remembers), leaving the OLD
+        index a permanently dangling reference. See fusion.py's
+        _fuse_point and _project_and_fuse for the required caller-side
+        cleanup using this return value.
+        """
+        previous = self.observations.get(frame_id)
         self.observations[frame_id] = keypoint_idx
+        return previous if (previous is not None and previous != keypoint_idx) else None
 
     def erase_observation(self, frame_id):
         """
