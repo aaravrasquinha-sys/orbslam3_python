@@ -81,6 +81,7 @@ def init_monocular(frame_a, frame_b, matcher, camera, world_map,
     if len(matches) >= 30:
         matches = matcher.rotation_consistency_filter(
             matches, frame_a.keypoints, frame_b.keypoints)
+    matches = matcher.dedupe_by_train_idx(matches)   # PHASE 7 BUGFIX -- see matcher.py
     if len(matches) < min_matches:
         return False, []
 
