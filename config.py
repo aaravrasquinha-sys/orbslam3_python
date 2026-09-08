@@ -45,20 +45,57 @@ DEFAULTS = {
     "tracking": {
         "min_matches_for_pose": 15,
         "keyframe_min_matches": 50,
-        "keyframe_min_displacement": 0.10,
+        # PHASE 7: raised from 0.10 to 0.25 -- 0.10m keyframe spacing was
+        # tuned for a small handheld test volume; at facility scale it
+        # produces far more keyframes than needed and pushes every
+        # downstream optimizer (BA, pose graph) into a larger problem
+        # than the trajectory actually requires. See
+        # PHASE7_ARCHITECTURE.md's config table.
+        "keyframe_min_displacement": 0.25,
         "keyframe_max_frames": 20,
+        # PHASE 7 (new): rotation-triggered keyframe insertion -- see
+        # tracking.py's needs_new_keyframe. A pure rotation with
+        # near-zero translation used to trigger no keyframe at all.
+        "keyframe_min_rotation_deg": 15.0,
+        # PHASE 7: Phase 4's dense RGB-D alignment fallback (use_dense_
+        # fallback / dense_depth_trunc) was REMOVED this phase -- it
+        # never worked reliably on real hardware, added an Open3D
+        # dependency, and its purpose is now substantially addressed at
+        # the front-end level by far-point triangulation and the
+        # rotation keyframe trigger above. See tracking.py's Phase 7
+        # comment in track() for the full account and the documented
+        # fallback plan if a genuinely featureless area is still a
+        # problem after these land.
     },
     "local_mapping": {
         "min_parallax_px": 2.0,
         "max_neighbors": 5,
         "culling_found_ratio": 0.25,
         "culling_min_obs": 3,
-        # ORB-SLAM3's RGB-D point-creation rule (see local_mapping.py):
-        "max_new_points_per_kf": 100,
+        # PHASE 7: raised from 100 -- real-time budget was never the
+        # constraint here (offline/CPU-bound extraction dominates), and
+        # the old cap combined with pure closest-first selection (see
+        # below) meant coverage was both small AND clustered.
+        "max_new_points_per_kf": 300,
         "depth_min": 0.3,
-        "depth_max": 3.5,
+        # PHASE 7: raised from 3.5 to 6.0. The D435i's active depth
+        # degrades past ~3-4m, which is exactly why points beyond
+        # th_depth are now treated as FAR (triangulated, weakly trusted
+        # for scale) rather than bare trusted depth -- see th_depth
+        # below. Capping the overall sane range higher just means more
+        # candidate far points are available to triangulate, not that
+        # more bare-depth points are trusted.
+        "depth_max": 6.0,
+        # PHASE 7 (new): ORB-SLAM2's close/far split -- ~40x the D435i's
+        # ~5cm IR baseline. See local_mapping.py's __init__ docstring
+        # and PHASE7_ARCHITECTURE.md finding 3.3.
+        "th_depth": 2.0,
         "depth_patch_radius": 2,
         "depth_rel_std_max": 0.02,
+        # PHASE 7 (new): stratified point selection grid -- see
+        # local_mapping.py's _stratified_select.
+        "strat_grid_rows": 4,
+        "strat_grid_cols": 4,
     },
     "bundle_adjust": {
         # BUGFIX (found during Phase 3 verification): this defaulted to
@@ -81,8 +118,17 @@ DEFAULTS = {
     },
     "loop_closing": {
         "min_keyframe_gap": 30,
-        "vocab_words": 10000,
+        "vocab_words": 10000,      # Phase 5: NO LONGER USED -- ORBVocabulary
+                                   # loads a fixed, real ~971,814-word
+                                   # vocabulary from disk (see
+                                   # orb_vocabulary.py); this key is kept
+                                   # only so old configs don't error on
+                                   # load, not read by anything anymore.
         "consistency_checks": 3,   # require same candidate over N consecutive KFs
+    },
+    "relocalization": {
+        "min_inliers": 20,
+        "top_n_candidates": 5,
     },
     "imu": {
         # BMI085 datasheet fallbacks -- measured (record.py's static-camera
