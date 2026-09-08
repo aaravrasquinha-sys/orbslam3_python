@@ -1,5 +1,17 @@
 """
-vocabulary.py — bag-of-visual-words place description.
+vocabulary.py — DEPRECATED as of Phase 5. Superseded by orb_vocabulary.py.
+
+Kept in the repo (not deleted) for two reasons: it documents the real
+bugs found and fixed in it during Phase 3 (the 133-second KMeans hang,
+the n_words clamp) which are worth keeping as project history, and
+nothing currently imports it -- deleting a file that might still be
+referenced by an external script somewhere is a needless risk for zero
+benefit. If you're looking for the live vocabulary implementation, it's
+orb_vocabulary.py: a real, pre-trained ORBvoc-format vocabulary tree,
+not this file's online KMeans placeholder. See that file's module
+docstring for why the replacement was necessary, not just an upgrade.
+
+bag-of-visual-words place description.
 
 Stands in for: Thirdparty/DBoW2 + Vocabulary/ORBvoc.txt
 
