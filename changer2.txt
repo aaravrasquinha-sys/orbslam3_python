@@ -486,5 +486,66 @@ to exist where before there would be none at all)
 ```
 
 
+Complete Phase 7 (Build 1) File Changes Summary
 
+TL;DR: 25 files modified, 6 new, 2 deleted.
+
+25 MODIFIED FILES
+
+Workstream A fixes (data-model invariants):
+
+frame.py — global Frame._next_kf_seq counter added
+map.py — add_keyframe uses global kf_seq, not per-map len(self.keyframes)
+merge_maps.py — removed kf_seq renumbering loop (now just sorts)
+
+Observation-pollution fixes (Phase 6's over-correction + three new bugs found via validate.py):
+4. tracking.py — REMOVED add_observation() from _track_local_map and _solve_pnp
+5. relocalization.py — REMOVED add_observation() from try_relocalize
+6. map_point.py — add_observation() now returns stale keypoint_idx if frame re-registered at different index
+7. local_mapping.py — defensive stale-index handling in process_new_keyframe
+8. fusion.py — _fuse_point uses stale-index return value, clears absorb.observations
+9. fusion.py — _project_and_fuse uses same stale-index pattern
+
+Workstream B (map coverage):
+10. local_mapping.py — close/far split at th_depth, stratified selection, far-point triangulation
+11. tracking.py — rotation-triggered keyframe insertion (needs_new_keyframe c4 check)
+12. config.py — 6 parameter changes: depth_max, th_depth, max_new_points_per_kf, keyframe_min_displacement, keyframe_min_rotation_deg, and removed use_dense_fallback/dense_depth_trunc
+
+Dense fallback removal:
+13. frame.py — removed keep_dense parameter
+14. run_slam.py — removed keep_dense=True, removed _pending_dense_cleanup
+15. run_dataset.py — removed keep_dense parameter
+
+Emitter handling (newly consumed):
+16. run_dataset.py — added emitter_on column logic (track only off-frames, borrow depth from on-frames)
+
+Matcher deduplication (trainIdx bug fix):
+17. matcher.py — added dedupe_by_train_idx() helper
+18. tracking.py — call dedupe_by_train_idx() in _solve_pnp
+19. relocalization.py — call dedupe_by_train_idx() in try_relocalize
+20. initializer.py — call dedupe_by_train_idx() in init_monocular
+
+Test suite:
+21. test_phase5_gate.py — removed Phase 4 from regression list
+22. test_phase6_gate.py — removed use_dense_fallback line
+
+Synthetic sequences:
+23. synthetic.py — added two_depth_scroll_sequence(), removed textureless_segment_sequence()
+
+Documentation:
+24. PROGRESS.md — added full Phase 7 section (6 bugs, 4 found by validate.py, complete trace methodology)
+25. requirements.txt — added gtsam, documented numpy<2.0 constraint
+
+6 NEW FILES
+validate.py — 8 Atlas-wide invariant checks
+test_phase7_gate.py — 11-test suite (9 new + 2 regressions)
+RUNBOOK_PHASE7.md — hardware troubleshooting guide
+FIELD_LOG_PHASE7.md — hardware testing template
+PHASE7_ARCHITECTURE.md — original batch-oriented design doc
+PHASE7_ARCHITECTURE_V2_REALTIME.md — revised real-time design (supersedes batch for Build 2+)
+2 DELETED FILES
+dense_odometry.py — Phase 4 module
+test_phase4_gate.py — Phase 4 gate
+
+All files with change details are in /mnt/user-data/outputs/PHASE7_FILE_CHANGES.txt for easy reference.
 
