@@ -15,10 +15,29 @@ no isInFrustum visibility test, no BoW vector stored per frame.
 """
 
 import numpy as np
+import cv2
 
 
 class Frame:
     _next_id = 0
+
+    # PHASE 7: global, Atlas-wide, monotonically-increasing counter for
+    # keyframe sequence numbers, assigned ONCE (in Map.add_keyframe) and
+    # NEVER reassigned afterward -- including across a map merge. This
+    # replaces the old per-Map counter (`frame.kf_seq = len(self.
+    # keyframes)` in map.py), which was the THIRD instance of the
+    # "kf_seq means something different depending on where you look"
+    # bug family (Phase 0 found it in update_normal_and_depth, Phase 5
+    # found it in loop_closing's gap check): merge_maps.py had to
+    # RENUMBER every keyframe's kf_seq after a merge (sorted by kf.id)
+    # because per-map numbering wasn't comparable across maps, and that
+    # renumbering silently invalidated every existing MapPoint's
+    # first_keyframe_id (stored in kf_seq units) that referenced the
+    # OLD numbering -- corrupting age-based culling on every point
+    # created before the merge. Making kf_seq global and permanent at
+    # the source removes the need to ever renumber it, which removes
+    # the bug family at the root rather than patching another symptom.
+    _next_kf_seq = 0
 
     def __init__(self, image, timestamp, camera, extractor, depth_image=None):
         self.id = Frame._next_id
