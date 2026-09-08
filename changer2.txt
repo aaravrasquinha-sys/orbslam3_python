@@ -1,0 +1,490 @@
+# Phase 7 (Build 1) Runbook — Data-Model Invariants + Map Coverage
+
+Companion to the earlier phase runbooks. Read §1 and §4.1 before
+debugging anything related to observation counts, dangling references,
+or map-point culling — this build found the third and fourth instances
+of a bug SHAPE Phase 6 already found once, and built a permanent tool
+(`validate.py`) specifically so a fifth instance doesn't need to be
+found by hand again.
+
+Also read this if you're picking up Build 2 (the real-time iSAM2 back
+end) — everything here is what it will be built on top of.
+
+---
+
+## 0. Context change before this build started
+
+The project's operating requirement changed mid-stream from "produce the
+most accurate possible offline reconstruction" to "run live on a
+slow-moving robot in the facility." That reframe is documented in full
+in `PHASE7_ARCHITECTURE.md` (the original batch-oriented plan) and
+`PHASE7_ARCHITECTURE_V2_REALTIME.md` (the revision — read this one
+first; it supersedes the back-end design in the first doc but the
+front-end/data-model findings in both are unaffected by the reframe).
+This build (Build 1) covers Workstreams A and B from those documents.
+Build 2 (real-time iSAM2 back end) and Build 3 (IMU + evaluation)
+follow in later phases and are NOT in this zip.
+
+Per an explicit instruction for this phase: **Phase 4 (dense RGB-D
+fallback) is removed entirely**, not just deprioritized. `dense_
+odometry.py` and `test_phase4_gate.py` are gone; every reference to
+them elsewhere is cleaned up. If you're diffing against `slam_v2_
+phase0_6.zip`, don't be alarmed that these files are missing — that's
+deliberate, see PROGRESS.md's Phase 7 section for the reasoning.
+
+---
+
+## 1. What changed, in one paragraph
+
+Three data-model invariant bugs were found and fixed at the root:
+`MapPoint.observations` was being polluted with non-keyframe frame ids
+(a Phase 6 fix that over-corrected), `kf_seq` was a per-map counter that
+silently invalidated point ages across a merge, and RGB-D mode never
+triangulated far points at all, leaving the map with zero far-field
+structure to hold onto during rotation. A new module, `validate.py`,
+checks eight Atlas-wide invariants and is meant to be run constantly,
+not just when something looks wrong. Running it for the first time
+surfaced FOUR more bugs this phase wasn't looking for, three of them the
+same underlying failure shape (a dict-based observation registry going
+stale relative to what a keyframe's own array actually holds) that
+Phase 6 already found once — this is now the third and fourth time this
+exact shape has recurred, in different call sites. Map coverage also
+improved: stratified spatial point selection, rotation-triggered
+keyframe insertion, and the `emitter_on` manifest column (written since
+early on, never consumed) is now actually used.
+
+---
+
+## 2. Architecture map
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  UNCHANGED FROM PHASE 1-6                                          │
+│    Everything in the earlier runbooks still applies                 │
+├─────────────────────────────────────────────────────────────────┤
+│  NEW THIS PHASE                                                     │
+│    validate.py         — 8 Atlas-wide invariant checks +            │
+│                          reference_validity_rate() (promotes the     │
+│                          old FIELD_LOG_PHASE6.md Sec.2 hand-check)   │
+│    Matcher.dedupe_by_train_idx() — matcher.py, new helper            │
+├─────────────────────────────────────────────────────────────────┤
+│  FIXED AT THE ROOT (Workstream A)                                   │
+│    frame.py / map.py     — kf_seq now global (Frame._next_kf_seq),  │
+│                            assigned once, never renumbered           │
+│    merge_maps.py         — no longer renumbers kf_seq on merge      │
+│    tracking.py (x2), relocalization.py — removed the Phase-6         │
+│                            add_observation() calls that polluted    │
+│                            .observations with non-keyframe ids       │
+├─────────────────────────────────────────────────────────────────┤
+│  FOUND VIA validate.py, NOT WHAT THIS PHASE SET OUT TO FIX           │
+│    local_mapping.py — _triangulate_new_points had no uniqueness     │
+│                       guard on the NEIGHBOR side (real gap, fixed,   │
+│                       but not the main cause -- see below)          │
+│    matcher.py         — match_ratio()/knnMatch() has no train-index  │
+│                       uniqueness guarantee; THE main root cause      │
+│                       (existed since Phase 3, never triggered a      │
+│                       failure until this phase's own front-end       │
+│                       changes made it fire often enough)             │
+│    fusion.py           — _fuse_point never cleared the ABSORBED       │
+│                       point's own .observations after redirecting    │
+│                       its entries -- the fourth instance of this     │
+│                       failure shape                                  │
+│    map.py              — erase_map_point/clean_bad_points got a      │
+│                       defensive ownership check as a second,         │
+│                       independent layer against the same shape       │
+├─────────────────────────────────────────────────────────────────┤
+│  CHANGED (Workstream B, map coverage)                                │
+│    local_mapping.py — close/far split (th_depth), far-point          │
+│                       triangulation in RGB-D mode, stratified        │
+│                       spatial point selection                        │
+│    tracking.py        — rotation-triggered keyframe insertion        │
+│    run_dataset.py     — consumes emitter_on (was written, unread)    │
+│    config.py           — depth_max, max_new_points_per_kf,           │
+│                       keyframe_min_displacement, th_depth,           │
+│                       keyframe_min_rotation_deg all changed/added    │
+├─────────────────────────────────────────────────────────────────┤
+│  REMOVED ENTIRELY                                                     │
+│    dense_odometry.py, test_phase4_gate.py, synthetic.py's            │
+│    textureless_segment_sequence() -- Phase 4 dropped per explicit    │
+│    instruction                                                        │
+├─────────────────────────────────────────────────────────────────┤
+│  STILL NOT DONE                                                       │
+│    iSAM2 real-time back end (Build 2), IMU wiring + evaluation       │
+│    harness (Build 3), dense reconstruction (Phase 9)                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Pre-flight checklist
+
+**3.1 — Run `validate.py` on any Atlas state you have, first, before
+anything else.** This is the single most useful health check this
+build introduced, and it now runs in code rather than by hand:
+```python
+import validate
+report = validate.validate_atlas(slam.atlas)
+print(report)   # empty error/warning lists = clean
+n_valid, n_total, pct = validate.reference_validity_rate(slam.atlas)
+print(f"{n_valid}/{n_total} = {pct:.1f}%")
+```
+Expect **zero errors and >99% reference validity** on any healthy run —
+this project's own synthetic measurement after all Build 1 fixes landed
+was 100.0% on both a plain scroll sequence and a rotation-heavy yaw
+sequence. If you see errors, the printed messages name the exact
+keyframe/point ids involved — that's enough to start tracing without
+needing to reproduce the ablation methodology from scratch (see
+PROGRESS.md's Phase 7 section for the full trace of how each of the
+four newly-found bugs was isolated, as a worked example).
+
+**3.2 — Run the full seven-phase gate before hardware.**
+```bash
+python3 test_phase7_gate.py
+```
+This internally re-runs Phases 1, 2, 3, 5, and 6's own gates (Phase 4's
+gate no longer exists — see §0) and exercises all of Build 1's own
+fixes directly. Budget several minutes; it processes multiple synthetic
+sequences through the real `SLAMSystem` and shells out to run every
+earlier phase's gate script as a subprocess.
+
+**3.3 — Confirm the vocabulary cache exists** before running anything
+that touches loop closing or relocalization (unchanged requirement from
+Phase 5/6, restated because a clean checkout of this zip won't have it):
+```bash
+ls orbvoc_cache.npz || python3 setup_vocabulary.py
+```
+
+**3.4 — Confirm which BA backend is actually active.** Unchanged from
+Phase 3, still worth checking since Build 2 will change this
+significantly:
+```bash
+python3 -c "from config import DEFAULTS as c; print(c['bundle_adjust']['backend'])"
+```
+
+---
+
+## 4. Symptom → diagnosis → fix
+
+### 4.1 — `validate.py` reports errors, or reference validity drops below 99%
+
+Read the SPECIFIC error messages first — they name the exact keyframe id,
+point id, and (where relevant) keypoint index involved, which is enough
+to start tracing without guessing. Before assuming this is a brand-new
+bug, check whether it matches one of the four failure shapes this phase
+already found and fixed (all documented in detail in PROGRESS.md's Phase
+7 section, with the exact tracing technique used for each):
+
+- **`check_observations_are_keyframes` fires** ("references frame X,
+  which is not a live keyframe") — look for a NEW `add_observation()`
+  call site that might be running on non-keyframe frames. Grep for it:
+  ```bash
+  grep -n "add_observation" *.py
+  ```
+  Every call site should be either (a) constructing a brand-new
+  MapPoint with an empty observations dict, or (b) inside `local_
+  mapping.process_new_keyframe`'s reconciliation step, or (c) inside
+  `fusion.py`'s two sites (which now correctly use the stale-index
+  return value — see below). If you've added a new one that registers
+  an ordinary TRACKED (non-keyframe) frame, that's the Phase 6 bug
+  recurring in a new location.
+
+- **`check_map_point_id_consistency` fires** ("dangling reference") —
+  this is the symptom, not the cause. Trace the SPECIFIC point id's full
+  lifecycle the same way PROGRESS.md's Phase 7 section does: hook
+  `MapPoint.__init__`, `MapPoint.add_observation`, `Map.erase_map_point`,
+  and `Map.clean_bad_points` to print whenever they touch that exact id,
+  then re-run the failing scenario. The four bugs this phase found were
+  all discovered exactly this way — don't guess, trace.
+
+- **A caller re-registers an already-observing frame at a NEW keypoint
+  index** — this is the general failure shape underlying THREE of the
+  four bugs found this phase (see PROGRESS.md's bugs 5 and 6). `MapPoint.
+  add_observation()` now RETURNS the previous keypoint index if this
+  happens (`None` if it's a genuinely new observation). **Any caller
+  that might legitimately re-register an existing frame_id at a
+  different index MUST use this return value** to clear the OLD
+  keyframe-side `map_point_ids[old_idx]` slot — see `fusion.py`'s two
+  call sites for the pattern. If you add a new caller that could hit
+  this (anything involving point fusion, merging, or re-matching an
+  already-tracked point) and don't use the return value, you will
+  silently reintroduce this bug family.
+
+- **A one-directional matcher call produces a duplicate correspondence**
+  — `Matcher.match()` and `Matcher.match_ratio()` (which wraps `cv2`'s
+  `knnMatch`) both guarantee a unique QUERY index per call but make NO
+  such guarantee on the TRAIN index. If you add a new call site that
+  builds `frame.map_point_ids[m.queryIdx] = some_id` directly from
+  matcher output, call `Matcher.dedupe_by_train_idx(matches)` on the
+  result FIRST (matches are already sorted best-distance-first, so this
+  keeps the best match per train index and drops worse duplicates). This
+  was the actual root cause of the largest reference-validity failure
+  found this phase (93.5%, should be >99%) — see PROGRESS.md bug 5 for
+  the full trace, including why it existed since Phase 3 without ever
+  being caught before this phase's own validator existed.
+
+### 4.2 — Map coverage or point counts look different from Phase 1-6 baselines
+
+Expected, and not itself a problem. Several deliberate changes affect
+this: `max_new_points_per_kf` 100→300, `depth_max` 3.5m→6.0m,
+`keyframe_min_displacement` 0.10m→0.25m (fewer, more spread-out
+keyframes), and RGB-D mode now triangulates far points where it
+previously created zero. If you have EXTERNAL baselines recorded before
+this phase, don't expect them to match exactly — check `validate.py`
+and `test_phase7_gate.py` instead, which were written/recalibrated
+against the current behavior.
+
+### 4.3 — A synthetic scene with a single fixed depth doesn't exercise the close/far split
+
+Expected — `scroll_sequence()` and `yaw_sequence()` both use ONE depth
+for the whole scene, so every point is either all-close or all-far and
+the split can't be meaningfully tested with them. Use `synthetic.
+two_depth_scroll_sequence()` instead (new this phase) — it composites a
+near plane and a far plane in the same frame specifically for this.
+
+### 4.4 — Rotation-triggered keyframes seem to fire too often or too rarely
+
+`keyframe_min_rotation_deg` (default 15°) is a straightforward
+threshold against `imu.log_so3`'s angle between the current frame's pose
+and the last keyframe's — there's no smoothing or hysteresis. If real
+hardware shows this firing on ordinary head-turn jitter, raise it; if it
+never fires during genuine rotation, lower it and re-check with
+`test_phase7_gate.py`'s Test 9 pattern (a direct unit test against
+`Tracking.needs_new_keyframe`, no full pipeline needed) before touching
+anything else.
+
+### 4.5 — `run_dataset.py --ir` recordings behave differently than before
+
+Expected — tracking now uses ONLY emitter-off (clean) frames and borrows
+depth from the nearest emitter-on neighbor, roughly halving the
+EFFECTIVE tracked frame rate for `--ir` recordings specifically (plain
+RGB recordings, with no `emitter_on` manifest column, are completely
+unaffected). This was previously recorded but silently ignored; the
+emitter's dot pattern was going straight into the extractor on every
+frame. If this regresses tracking quality on a specific recording,
+check first whether that recording actually alternates the emitter (has
+a real `emitter_on` column with both True/False values) — a recording
+made without `--ir` won't trigger this code path at all.
+
+---
+
+## 5. Testing order
+
+1. `validate.py` on a fresh, short recording (§3.1) — confirms the core
+  fixes are in place before testing anything more elaborate.
+2. Full `test_phase7_gate.py` suite (§3.2).
+3. `two_depth_scroll_sequence()` (§4.3) if you're specifically verifying
+  the close/far split rather than trusting the gate suite's own check.
+4. A real facility recording, `run_dataset.py`, checking `validate.py`'s
+  reference-validity percentage stays >99% throughout — not just at the
+  end, since the four bugs found this phase all manifested as gradual
+  degradation, not an immediate crash.
+
+## 6. What "success" looks like for this build
+
+1. `validate.py` reads zero errors and >99% reference validity on real
+  hardware footage, not just synthetic tests.
+2. A rotation-heavy real segment (turning to look down a corridor, the
+  original failure mode from the very first forensic pass on this
+  project) shows tracked point count holding up better than Phase 1-6
+  baselines, because far points now survive rotation where they
+  previously didn't exist at all.
+3. No unexplained new fragmentation compared to Phase 5/6 baselines —
+  the config changes (larger keyframe spacing, more points per keyframe)
+  should if anything reduce map-lifecycle churn, not increase it.
+4. If you recorded with `--ir`, `run_dataset.py`'s output shows the
+  `[emitter]` log line reporting a real on/off frame split, not silence
+  (silence means the manifest doesn't have the column at all — check
+  the recording was actually made with `--ir`).
+
+# Field Log — Phase 7, Build 1 Hardware Verification (Data-Model Invariants + Map Coverage)
+
+Same rules as before: actual command output, not a prose summary. Build
+1 has NOT been tested on real hardware at all yet. Write "N/A" rather
+than skip a field silently. Phase 4 (dense RGB-D fallback) is REMOVED
+this phase — don't run any `--dense` or `use_dense_fallback` commands
+from earlier field logs, they no longer exist.
+
+---
+
+## 0. Environment
+
+```bash
+python3 -c "import cv2, gtsam; print('opencv', cv2.__version__, 'gtsam ok')"
+ls orbvoc_cache.npz || echo "MISSING -- run setup_vocabulary.py first"
+python3 -c "from config import DEFAULTS as c; print(c['local_mapping']); print(c['tracking'])"
+grep -c "add_observation" tracking.py fusion.py relocalization.py local_mapping.py
+```
+**Paste output:**
+```
+[paste here]
+```
+
+**Confirm no dense-fallback leftovers:**
+```bash
+grep -rn "dense_odometry\|use_dense_fallback" *.py
+```
+**Expect zero matches. Paste output:**
+```
+[paste here]
+```
+
+---
+
+## 1. Synthetic gates (no camera needed)
+
+```bash
+python3 test_phase7_gate.py 2>&1 | tail -60
+```
+**Paste the full tail output, and how long the whole thing took:**
+```
+[paste here]
+```
+
+Time taken: **___ seconds**
+
+---
+
+## 2. validate.py health check (the most important new diagnostic this build)
+
+Run this on ANY map state you can get access to during/after a real test:
+```python
+import validate
+report = validate.validate_atlas(slam.atlas)
+print(report)
+n_valid, n_total, pct = validate.reference_validity_rate(slam.atlas)
+print(f"{n_valid}/{n_total} = {pct:.1f}%")
+```
+**Paste output:**
+```
+[paste here]
+```
+**Errors present?** [ ] Yes  [ ] No — if yes, paste every error message
+verbatim (they name specific keyframe/point ids, needed for tracing):
+```
+[paste here]
+```
+**Reference validity percentage:** ______%  (expect >99%; this
+project's synthetic measurement after all Build 1 fixes was 100.0% on
+both a plain scroll and a rotation-heavy yaw sequence)
+
+---
+
+## 3. Close/far point split on a real scene
+
+Point the camera at a scene with BOTH a near surface (<2m) and a
+farther one (>2m) visible simultaneously — a hallway looking down its
+length works well.
+
+```python
+near_pts, far_pts = 0, 0
+for mp in slam.atlas.active_map.map_points.values():
+    if mp.is_bad: continue
+    z = mp.position[2]  # or appropriate depth axis for your world frame
+    if z < 2.0: near_pts += 1
+    else: far_pts += 1
+print(f"near={near_pts} far={far_pts}")
+```
+**Paste output:**
+```
+[paste here]
+```
+**Both near and far points present?** [ ] Yes  [ ] No
+
+---
+
+## 4. Rotation-triggered keyframe insertion
+
+Do a slow, deliberate ~30-45 degree yaw with minimal translation (turn
+in place, or pivot at a corner) and check the keyframe log:
+
+Command run:
+```bash
+python3 run_dataset.py --dataset [your dataset] 2>&1 | grep -A2 "\[TRACK\]" | tail -60
+```
+**Paste a stretch covering the rotation:**
+```
+[paste here]
+```
+**Did a keyframe get created during the rotation despite minimal
+translation?** [ ] Yes  [ ] No
+
+---
+
+## 5. `--ir` emitter-alternation handling (skip this section entirely if you didn't record with `--ir`)
+
+```bash
+python3 run_dataset.py --dataset [your --ir dataset]
+```
+**Paste the `[emitter]` log line near the start of output:**
+```
+[paste here]
+```
+**Tracked frame count roughly half the total recorded frames?**
+[ ] Yes  [ ] No  [ ] N/A (not an --ir recording)
+
+---
+
+## 6. The 30cm-forward/turn/30cm-back loop test
+
+Command run:
+```bash
+python3 run_dataset.py --dataset [your dataset] --sequence-short-loop
+```
+(or however this test is invoked in your setup — match the pattern from
+earlier field logs)
+
+**Final summary block:**
+```
+[paste here]
+```
+
+**map_health() dict:**
+```python
+import metrics
+print(metrics.map_health(slam))
+```
+```
+[paste here]
+```
+
+**validate.py check on this same run (§2 again, different scenario):**
+```
+[paste here]
+```
+
+---
+
+## 7. Comparison note
+
+If you have a Phase 5 or 6 field log from the SAME physical test setup
+(same room, same motion), how does this run's point count / far-point
+presence / keyframe count compare? (doesn't need to be precise, just a
+sanity comparison — expect MORE keyframes than before given the larger
+`keyframe_min_displacement`, but SPREAD OUT more, and expect far points
+to exist where before there would be none at all)
+```
+[paste here]
+```
+
+---
+
+## 8. Self-check before sending
+
+* [ ] `orbvoc_cache.npz` exists (or was generated via `setup_vocabulary.py`)
+* [ ] No `dense_odometry`/`use_dense_fallback` references anywhere (§0)
+* [ ] `validate.py` shows zero errors and >99% reference validity on
+     every run in this log, not just the synthetic gate
+* [ ] Far points confirmed present on a real scene with depth variation (§3)
+* [ ] Rotation-triggered keyframe confirmed on a real deliberate turn (§4)
+
+---
+
+## 9. Anything else noticed
+
+```
+[paste here]
+```
+
+
+
+
