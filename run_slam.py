@@ -113,6 +113,15 @@ class SLAMSystem:
         self.bias_gyro = np.zeros(3)
         self.bias_accel = np.zeros(3)
         self.last_ok_timestamp = None
+        # PHASE 8: raw per-stream buffers for the LIVE realsense capture
+        # path (run_realsense()) -- accel and gyro arrive as separate
+        # async streams at different native rates, so they're buffered
+        # here and synchronized (imu.synchronize()) once per process()
+        # call rather than per-sample. Unused/empty for any other input
+        # path (run_dataset.py already hands over pre-synchronized rows
+        # loaded straight from a recording's imu.csv).
+        self._live_accel_buf = []
+        self._live_gyro_buf = []
 
         self.frames = []
         self.init_candidate = None
@@ -470,8 +479,23 @@ class SLAMSystem:
                   f"scale={merge_stats['scale_applied']:.3f})")
         return world_map
 
-
+    def _try_imu_init(self, world_map):
         """
+        PHASE 8 BUGFIX: this method's docstring and body existed in the
+        code, but the `def _try_imu_init(self, world_map):` signature line
+        itself was MISSING -- the entire block was dead, dangling code
+        sitting after _handle_loop_result's own `return`, not a real
+        method. `hasattr(SLAMSystem, '_try_imu_init')` returned False.
+        The call site in process() (`if self.use_imu and not self.
+        tracking.imu_initialized: self._try_imu_init(world_map)`) would
+        raise AttributeError on the very first keyframe processed with
+        use_imu=True -- meaning IMU initialization has never successfully
+        run, in any test, on any recording, ever, in this project's
+        history. Nothing caught this because no gate test and no field
+        log ever actually set use_imu=True end-to-end (see PROGRESS.md's
+        Phase 8 section for the full account and test_phase8_gate.py for
+        the regression test that exercises this directly).
+
         Attempt staged inertial initialization (imu_init.py) once enough
         keyframes with attached preintegration segments exist. On success,
         assigns velocities to those keyframes, stores gravity/bias, and
@@ -622,6 +646,18 @@ def run_realsense(args):
     usable -- see the architecture notes. Uses emitter_on_off alternating
     mode: even frames keep the projector pattern (for depth), odd frames
     are clean for ORB (real-time isn't a priority, so halving the rate is fine).
+
+    --imu (PHASE 8): enables the D435i's accel (250Hz) + gyro (200Hz)
+    motion streams and feeds synchronized samples into slam.process() every
+    iteration. Uses the exact same technique record.py's proven offline
+    recorder already uses (motion frames arrive interleaved in the same
+    `pipeline.wait_for_frames()` frameset as video/depth when enabled on
+    one pipeline -- iterate the frameset and pick out `is_motion_frame()`
+    entries, no separate thread or callback needed) -- see record.py's
+    docstring for why this works and PROGRESS.md's Phase 8 section for
+    why this was never actually wired here before, despite the tracking/
+    initialization code that CONSUMES this data having existed since
+    before Phase 6.
     """
     import pyrealsense2 as rs
 
@@ -633,7 +669,8 @@ def run_realsense(args):
     os.makedirs("calibration", exist_ok=True)
     camera.to_json("calibration/realsense_d435.json")
 
-    slam = SLAMSystem(camera, use_depth=not args.mono, verbose=not args.quiet)
+    slam = SLAMSystem(camera, use_depth=not args.mono, verbose=not args.quiet,
+                      use_imu=args.imu)
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -645,18 +682,36 @@ def run_realsense(args):
         config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
         align = rs.align(rs.stream.color)
 
+    if args.imu:
+        # PHASE 8: native rate (0 = sensor's own rate -- 250Hz accel /
+        # 200Hz gyro on the D435i's BMI085, matching record.py exactly).
+        config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 0)
+        config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, 0)
+
     profile = pipeline.start(config)
+
+    # PHASE 8: put every sensor's timestamps on ONE clock -- critical for
+    # IMU (video and motion frames come from physically different sensors
+    # with independent internal clocks otherwise). record.py has done this
+    # unconditionally for a while; this path only ever did it inside the
+    # --ir branch, which meant a plain RGB + --imu run never got it at
+    # all. Doing it unconditionally, same as record.py.
+    for sensor in profile.get_device().sensors:
+        if sensor.supports(rs.option.global_time_enabled):
+            sensor.set_option(rs.option.global_time_enabled, 1)
 
     if args.ir:
         depth_sensor = profile.get_device().first_depth_sensor()
-        if depth_sensor.supports(rs.option.global_time_enabled):
-            depth_sensor.set_option(rs.option.global_time_enabled, 1)
-        for s in profile.get_device().sensors:
-            if s.supports(rs.option.global_time_enabled):
-                s.set_option(rs.option.global_time_enabled, 1)
         if depth_sensor.supports(rs.option.emitter_on_off):
             depth_sensor.set_option(rs.option.emitter_on_off, 1)
             depth_sensor.set_option(rs.option.emitter_enabled, 1)
+
+    if args.imu:
+        R_cam_imu = imu.load_T_cam_imu(args.t_cam_imu) if args.t_cam_imu else np.eye(3)
+        if args.t_cam_imu is None:
+            print("[imu] no --t_cam_imu given -- using identity rotation "
+                 "(fine for a quick test; for real use, record a "
+                 "T_cam_imu.txt via record.py --imu and pass it here)")
 
     total_target_frames = args.fps * args.seconds
     print(f"\nStreaming at {args.fps} FPS. Capturing approximately {total_target_frames} target frames ({args.fps} per second over {args.seconds} seconds).\n")
@@ -665,10 +720,27 @@ def run_realsense(args):
     processed_count = 0
     frame_counter = 0
     pending_ir_clean = None   # holds the last emitter-off IR frame while we wait for the paired depth
+    last_process_t = None     # PHASE 8: wall-clock cursor for slicing IMU samples per process() call
 
     try:
         while processed_count < total_target_frames:
             frames = pipeline.wait_for_frames()
+
+            # PHASE 8: pull out any motion samples riding along in this
+            # frameset BEFORE the video-frame branching below (which uses
+            # `continue` in several places -- IMU samples must not be
+            # dropped just because this particular frameset didn't yield
+            # a usable video frame this iteration).
+            if args.imu:
+                for f in frames:
+                    if f.is_motion_frame():
+                        mf = f.as_motion_frame()
+                        md = mf.get_motion_data()
+                        ts = mf.get_timestamp() / 1000.0   # ms -> s, global clock
+                        stream = "accel" if mf.get_profile().stream_type() == rs.stream.accel else "gyro"
+                        raw = np.array([ts, md.x, md.y, md.z])
+                        (slam._live_accel_buf if stream == "accel"
+                         else slam._live_gyro_buf).append(raw)
 
             if args.ir:
                 ir = frames.get_infrared_frame(1)
@@ -705,7 +777,33 @@ def run_realsense(args):
 
             processed_count += 1
             print(f"Processing target frame {processed_count}/{total_target_frames}")
-            slam.process(color_img, time.time() - t0, depth_image=depth_img)
+            this_t = time.time() - t0
+
+            imu_samples = None
+            if args.imu:
+                # PHASE 8: synchronize (interpolate accel onto gyro
+                # timestamps, rotate into camera frame -- imu.py's
+                # synchronize()) whatever's accumulated since the last
+                # process() call, then slice to exactly this interval.
+                # Buffers keep everything seen so far rather than being
+                # cleared every iteration -- interpolation needs a little
+                # context on both sides of the window to avoid edge
+                # artifacts, and imu.slice_between already does the exact
+                # windowing we need on the synchronized result.
+                sync = imu.synchronize(
+                    {"accel": np.asarray(slam._live_accel_buf) if slam._live_accel_buf else np.zeros((0, 4)),
+                     "gyro": np.asarray(slam._live_gyro_buf) if slam._live_gyro_buf else np.zeros((0, 4))},
+                    R_cam_imu=R_cam_imu)
+                lo = last_process_t if last_process_t is not None else this_t - (1.0 / args.fps)
+                imu_samples = imu.slice_between(sync, lo, this_t)
+                # Trim buffers so they don't grow for the whole session --
+                # keep a small tail before `lo` for the next interpolation.
+                keep_from = lo - 0.05
+                slam._live_accel_buf = [r for r in slam._live_accel_buf if r[0] >= keep_from]
+                slam._live_gyro_buf = [r for r in slam._live_gyro_buf if r[0] >= keep_from]
+                last_process_t = this_t
+
+            slam.process(color_img, this_t, depth_image=depth_img, imu_samples=imu_samples)
 
     except KeyboardInterrupt:
         print("\nStopped by user.")
@@ -760,6 +858,20 @@ def main():
                          "registered) instead of RGB. See camera.py docstring. "
                          "Only worth it if the facility has enough natural "
                          "texture for emitter-off IR frames to be usable.")
+    ap.add_argument("--imu", action="store_true",
+                    help="PHASE 8: enable the D435i's accel+gyro motion "
+                         "streams and feed them into the pipeline for "
+                         "IMU-predicted pose (tracking robustness through "
+                         "fast rotation / motion blur) and IMU-coasted "
+                         "recovery during brief tracking loss. --realsense "
+                         "only -- --frames has no IMU source.")
+    ap.add_argument("--t_cam_imu", type=str, default=None,
+                    help="path to a T_cam_imu.txt (4x4) from record.py's "
+                         "--imu extrinsics dump. Only the rotation block is "
+                         "used (imu.py's lever-arm simplification). Falls "
+                         "back to identity if omitted -- fine for a quick "
+                         "test, but a real T_cam_imu measurement matters "
+                         "for prediction accuracy.")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
