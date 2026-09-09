@@ -184,6 +184,96 @@ def two_depth_scroll_sequence(n_frames=60, height=480, width=640,
     return images, depths, gt_poses, cam
 
 
+def imu_ground_truth_sequence(duration=6.0, imu_rate=200.0,
+                              yaw_amp=0.3, f_yaw=0.5,
+                              pos_amp=0.5, f_pos=0.5,
+                              gravity_mag=9.81):
+    """
+    PHASE 8: analytic ground-truth trajectory + synthetic IMU samples, for
+    testing imu.py's preintegration and imu_init.py's staged
+    initialization directly against a KNOWN closed-form answer, bypassing
+    the visual pipeline entirely. Nothing before this phase had ever
+    verified either of these end-to-end -- see PROGRESS.md's Phase 8
+    section for why that's a real gap this closes, not a formality.
+
+    Motion: camera oscillates side-to-side along world X (genuine, time-
+    varying linear ACCELERATION, for the accel-excitation half of
+    imu_init.observability_gate) while simultaneously yawing back and
+    forth about its own Y axis (genuine angular velocity, for the gyro-
+    excitation half) -- both needed at once to pass the gate, matching
+    the same "rotate AND do some stop-start motion" instruction that
+    module's own error messages give an operator.
+
+    Both are pure single-axis motions specifically so the ground-truth
+    math stays exact and closed-form (rotation about a FIXED single axis
+    commutes, so body-frame angular velocity is trivially [0, dpsi/dt, 0]
+    with no second-order coupling term to get wrong) -- this is deliberately
+    a clean unit-test scenario, not a claim that real facility motion looks
+    like this.
+
+    Returns a dict:
+      t_imu, imu_samples   -- (N,) and (N,7) [t,gx,gy,gz,ax,ay,az], already
+                              in the camera/body frame (R_cam_imu=identity
+                              for this synthetic case)
+      pose_fn(t)            -- exact 4x4 camera-to-world pose at any t
+      velocity_fn(t)         -- exact 3-vector world-frame velocity at any t
+                              (what keyframe.velocity should equal)
+      gravity                -- the world-frame gravity vector used, matching
+                              imu_init.py's own convention (points -Y)
+    """
+    gravity = np.array([0.0, -gravity_mag, 0.0])
+    n = int(duration * imu_rate)
+    t_imu = np.arange(n) / imu_rate
+
+    def yaw(t):
+        return yaw_amp * np.sin(2 * np.pi * f_yaw * t)
+
+    def dyaw(t):
+        return yaw_amp * 2 * np.pi * f_yaw * np.cos(2 * np.pi * f_yaw * t)
+
+    def pos_x(t):
+        return pos_amp * np.sin(2 * np.pi * f_pos * t)
+
+    def vel_x(t):
+        return pos_amp * 2 * np.pi * f_pos * np.cos(2 * np.pi * f_pos * t)
+
+    def acc_x(t):
+        return -pos_amp * (2 * np.pi * f_pos) ** 2 * np.sin(2 * np.pi * f_pos * t)
+
+    def R_of(t):
+        psi = yaw(t)
+        c, s = np.cos(psi), np.sin(psi)
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+    def pose_fn(t):
+        T = np.eye(4)
+        T[:3, :3] = R_of(t)
+        T[0, 3] = pos_x(t)
+        return T
+
+    def velocity_fn(t):
+        return np.array([vel_x(t), 0.0, 0.0])
+
+    gyro = np.zeros((n, 3))
+    accel = np.zeros((n, 3))
+    for i, t in enumerate(t_imu):
+        R = R_of(t)
+        gyro[i] = [0.0, dyaw(t), 0.0]
+        a_world_lin = np.array([acc_x(t), 0.0, 0.0])
+        # Standard IMU convention: accelerometer reads PROPER (specific)
+        # acceleration, i.e. world acceleration minus gravity, expressed
+        # in the body frame -- matches imu_init.py's own kinematic
+        # equation `p_j = p_i + v_i*dt + 0.5*g*dt^2 + R_i @ dp`.
+        accel[i] = R.T @ (a_world_lin - gravity)
+
+    imu_samples = np.concatenate([t_imu[:, None], gyro, accel], axis=1)
+    return {
+        "t_imu": t_imu, "imu_samples": imu_samples,
+        "pose_fn": pose_fn, "velocity_fn": velocity_fn,
+        "gravity": gravity,
+    }
+
+
 def yaw_sequence(n_frames=120, height=480, width=640, depth_m=2.0,
                  max_yaw_deg=25.0, seed=1, fx=385.0, fy=385.0):
     """
@@ -218,3 +308,52 @@ def yaw_sequence(n_frames=120, height=480, width=640, depth_m=2.0,
     cam = dict(fx=fx, fy=fy, cx=width / 2, cy=height / 2,
               width=width, height=height, depth_scale=0.001)
     return images, depths, gt_poses, cam
+
+
+def imu_visual_sequence(pose_fn, duration=6.0, camera_hz=20.0,
+                        height=480, width=640, depth_m=2.0,
+                        fx=385.0, fy=385.0, seed=3):
+    """
+    PHASE 8: visual frames matching the EXACT camera motion of
+    imu_ground_truth_sequence()'s pose_fn -- lets test_phase8_gate.py run
+    the real SLAMSystem (not just the IMU math in isolation) over a
+    sequence where the visual and inertial ground truth are the same
+    underlying trajectory, so imu_init.py's stage 1 (which aligns
+    preintegrated rotation against VISUALLY estimated relative rotation
+    between keyframes) has something consistent to align against.
+
+    Combines yaw_sequence's homography-warp technique (rotation) with
+    scroll_sequence's pixel-pan technique (translation) -- an
+    approximation, not a full 3D-consistent render, same spirit as every
+    other generator in this module. Good enough to exercise the real
+    pipeline's control flow and produce roughly-correct keyframe poses;
+    not meant to be pixel-perfect.
+    """
+    rng = np.random.RandomState(seed)
+    n_frames = int(duration * camera_hz)
+    pad = int(2.0 * fx)   # headroom for the translation pan
+    base = _make_texture(rng, height, width + 2 * pad)
+
+    K = np.array([[fx, 0, width / 2], [0, fy, height / 2], [0, 0, 1]])
+    images, depths, gt_poses, frame_times = [], [], [], []
+    for i in range(n_frames):
+        t = i / camera_hz
+        T = pose_fn(t)
+        R = T[:3, :3]
+        x = T[0, 3]
+        px_shift = int(round(x * fx / depth_m)) + pad
+        px_shift = max(0, min(px_shift, base.shape[1] - width))
+        strip = base[:, px_shift:px_shift + width]
+
+        H = K @ R @ np.linalg.inv(K)
+        H /= H[2, 2]
+        img = cv2.warpPerspective(strip, H, (width, height))
+
+        images.append(img)
+        depths.append(np.full((height, width), int(depth_m * 1000), np.uint16))
+        gt_poses.append(T)
+        frame_times.append(t)
+
+    cam = dict(fx=fx, fy=fy, cx=width / 2, cy=height / 2,
+              width=width, height=height, depth_scale=0.001)
+    return images, depths, gt_poses, frame_times, cam
