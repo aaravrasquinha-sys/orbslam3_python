@@ -145,6 +145,31 @@ class Tracking:
             n_expanded = self._track_local_map(frame)
 
             self.state = "OK"
+
+            # PHASE 8 BUGFIX: frame.velocity used to only get set inside
+            # Strategy 0's own success branch above -- so the FIRST time
+            # any OTHER strategy (constant-velocity or reference-keyframe)
+            # is what actually succeeds, this frame's velocity silently
+            # stays None. If that frame then becomes last_keyframe,
+            # _predict_pose_imu's guard (`last_keyframe.velocity is not
+            # None`) permanently disables Strategy 0 for every future
+            # frame -- nothing ever re-derives it. This is a single point
+            # of failure that's especially likely to trigger during the
+            # exact fast-motion conditions IMU prediction exists to help
+            # with (Strategy 0 rejected by PnP verification, Strategy 1/2
+            # picks up the slack instead). Fixed by propagating velocity
+            # from the IMU measurements themselves whenever IMU is
+            # initialized and a preintegration segment exists -- velocity
+            # depends only on the accel integral (see _predict_pose_imu),
+            # not on which strategy verified the resulting position, so
+            # this is correct regardless of which strategy succeeded.
+            if predicted_vel is not None:
+                frame.velocity = predicted_vel
+            elif (self.imu_initialized and imu_preint is not None
+                    and self.last_keyframe is not None
+                    and self.last_keyframe.velocity is not None):
+                _, frame.velocity = self._predict_pose_imu(self.last_keyframe, imu_preint)
+
             # update motion model: velocity = current * inverse(last)
             if self.last_frame is not None and self.last_frame.pose is not None:
                 self.velocity = frame.pose @ np.linalg.inv(self.last_frame.pose)
