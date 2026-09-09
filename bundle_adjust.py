@@ -439,13 +439,64 @@ def local_inertial_bundle_adjust(world_map, camera, gravity, bias_gyro=None, bia
             else vis_res.reshape(-1)
 
     before = float(np.sum(residuals(x0) ** 2))
+
+    # ── sparse Jacobian pattern (PHASE 8 BUGFIX) ────────────────────────
+    # This call had NO jac_sparsity at all -- scipy silently falls back to
+    # a DENSE finite-difference Jacobian (O(n_params) residual evaluations
+    # PER optimizer iteration, no exploitation of the fact that any one
+    # residual only actually depends on 1-2 keyframes' worth of
+    # parameters). This is the exact same failure MODE as the original
+    # pre-Phase-1 "BA hang" bug local_bundle_adjust() above was already
+    # fixed for -- just never applied to this sibling function. Measured
+    # directly: hung for minutes (never returned) on an 8-second/160-
+    # frame synthetic sequence with use_imu=True, traced via faulthandler
+    # to scipy's _dense_difference inside this exact call. Nothing had
+    # ever exercised this function end-to-end before Phase 8's gate, since
+    # imu_initialized could never previously reach True at all (see
+    # run_slam.py's _try_imu_init docstring for that separate bug).
+    #
+    # Visual residual row-pair for observation k depends on: cam k's pose
+    # block (6 of the 9 state columns -- velocity doesn't affect a
+    # reprojection) if that camera is free, plus its point's xyz block.
+    # Inertial residual block for consecutive pair i depends on: the
+    # CURRENT free keyframe's full (pose+vel) 9-column block, and the
+    # PREVIOUS keyframe's full 9-column block too, UNLESS the previous
+    # one is the anchor (fixed, contributes no columns).
+    n_params = n_pose_vel_params + n_points * 3
+    n_inertial_rows = len(free_kfs) * 9
+    sparsity = lil_matrix((n_obs * 2 + n_inertial_rows, n_params), dtype=bool)
+
+    row_pairs = np.arange(n_obs) * 2
+    for k in range(n_obs):
+        r0 = row_pairs[k]
+        cam = obs_cam[k]   # -1 = anchor (fixed), else free-keyframe index
+        if cam >= 0:
+            c0 = cam * n_state_per_kf
+            sparsity[r0:r0 + 2, c0:c0 + 6] = True   # pose only, not velocity
+        pc0 = n_pose_vel_params + obs_pt[k] * 3
+        sparsity[r0:r0 + 2, pc0:pc0 + 3] = True
+
+    inertial_row0 = n_obs * 2
+    for i in range(1, len(imu_pairs)):
+        r0 = inertial_row0 + (i - 1) * 9
+        cur_free_idx = i - 1          # imu_pairs[i] == free_kfs[i-1]
+        sparsity[r0:r0 + 9, cur_free_idx * 9: cur_free_idx * 9 + 9] = True
+        if i - 1 > 0:                 # imu_pairs[i-1] == free_kfs[i-2], else anchor (fixed)
+            prev_free_idx = i - 2
+            sparsity[r0:r0 + 9, prev_free_idx * 9: prev_free_idx * 9 + 9] = True
+
     try:
-        result = least_squares(residuals, x0, method='trf', loss='huber',
-                               f_scale=huber_f_scale, max_nfev=max_iter * 30)
+        result = least_squares(
+            residuals, x0,
+            jac_sparsity=sparsity.tocsr(),
+            method='trf', tr_solver='lsmr',
+            x_scale='jac', loss='huber', f_scale=huber_f_scale,
+            max_nfev=max_iter * 25,
+        )
         x_opt = result.x
     except ValueError as e:
         if verbose:
-            print(f"    [VI-BA] solve failed ({e}); skipping this call")
+            print(f"    [VI-BA] sparse solve failed ({e}); skipping this call")
         return 0
     after = float(np.sum(residuals(x_opt) ** 2))
 
