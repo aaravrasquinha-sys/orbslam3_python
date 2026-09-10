@@ -78,6 +78,48 @@ draft because the batch windowed BA this module replaces never needed
 it (a whole window is typically densely co-visible by construction, so
 this gap rarely if ever shows up there).
 
+POST-PHASE-9 HARDWARE FIX (first real D435i session, not synthetic):
+every synthetic test in this phase used near-noiseless data, and the
+noise models above (1px flat observation sigma, a fixed 5cm/0.05rad
+odometry sigma) were tuned against that. Real tracking is visibly
+noisier -- RANSAC inlier counts as low as single digits, raw matches in
+the teens -- and on a real session the SAME
+IndeterminantLinearSystemException the "odometry factor" fix above was
+built for started recurring on almost EVERY keyframe after the first
+failure, with zero recovery for the rest of a 30-second session. Two
+changes address this directly:
+  1. Observation noise is now scaled by keypoint OCTAVE (same
+     convention ORB-SLAM3 itself uses: level_sigma2[octave], from the
+     SAME extractor.scale_factor pyramid this project already computes
+     elsewhere) instead of a flat 1px for every observation regardless
+     of pyramid level -- a coarse-octave keypoint's pixel location is
+     genuinely less precise, and treating it as equally precise as a
+     fine-octave one overweights it in the solve.
+  2. The odometry factor's noise is scaled by how many points the
+     keyframe actually tracked (frame.n_tracked_points()) -- a keyframe
+     that barely held onto tracking (the marginal, low-inlier frames
+     visible throughout a real session) gets a LOOSER odometry
+     constraint, instead of asserting the same tight 5cm/0.05rad
+     confidence regardless of how well-tracked that keyframe actually
+     was.
+Even with both, a real session can still occasionally hit a genuinely
+ill-conditioned update -- real data has outliers no noise model fully
+absorbs. What changed is what happens next: previously a failure just
+logged a warning and left the graph in whatever partially-committed
+state GTSAM left it in, which is exactly the condition that caused
+every SUBSEQUENT update to keep failing too (nothing in the design
+before this fix ever attempted to un-stick it). Now, after
+reset_after_n_consecutive_failures (default 3) consecutive failures,
+the whole ISAM2 instance is rebuilt from scratch (fresh Bayes tree, no
+memory of the region that got stuck) and the failing keyframe is
+retried immediately against the clean graph. This trades "stop
+iSAM2-refining the trajectory before this point" for "keep genuinely
+refining something for the rest of the session" -- given the observed
+alternative on real hardware (zero refinement for 90%+ of a session
+after the first failure), this is a clear improvement, not a full fix
+for whatever the underlying per-point ill-conditioning is. See
+_reset()'s own docstring.
+
 ON SCALING (measured this phase, see test_phase9_gate.py's benchmark):
   incremental isam.update() calls on a synthetic multi-hundred-keyframe
   trajectory averaged low tens of milliseconds per keyframe on this
@@ -123,9 +165,15 @@ class Isam2Backend:
     def __init__(self, camera, virtual_baseline=0.05, huber_f_scale=2.0,
                 min_obs_to_optimize=2, relinearize_threshold=0.1,
                 relinearize_skip=1, anchor_sigma_pos=1e-3, anchor_sigma_rot=1e-2,
-                odom_sigma_pos=0.05, odom_sigma_rot=0.05):
+                odom_sigma_pos=0.05, odom_sigma_rot=0.05,
+                base_pixel_sigma=1.5, level_sigma2=None,
+                odom_confidence_ref_points=100, odom_confidence_max_scale=5.0,
+                reset_after_n_consecutive_failures=3):
         self.camera = camera
         self.min_obs_to_optimize = min_obs_to_optimize
+        # kept for _reset() to rebuild an identically-configured ISAM2
+        self._relinearize_threshold = relinearize_threshold
+        self._relinearize_skip = relinearize_skip
 
         params = gtsam.ISAM2Params()
         params.setRelinearizeThreshold(relinearize_threshold)
@@ -136,18 +184,36 @@ class Isam2Backend:
                                       virtual_baseline)
         self.K_mono = Cal3_S2(camera.fx, camera.fy, 0.0, camera.cx, camera.cy)
         self.virtual_baseline = virtual_baseline
-        huber = gtsam.noiseModel.mEstimator.Huber.Create(huber_f_scale)
-        self.stereo_noise = gtsam.noiseModel.Robust.Create(
-            huber, gtsam.noiseModel.Isotropic.Sigma(3, 1.0))
-        self.mono_noise = gtsam.noiseModel.Robust.Create(
-            huber, gtsam.noiseModel.Isotropic.Sigma(2, 1.0))
+        self.huber_f_scale = huber_f_scale
+        self.huber = gtsam.noiseModel.mEstimator.Huber.Create(huber_f_scale)
+        # POST-PHASE-9 FIX: base pixel sigma raised from a flat 1.0px
+        # (calibrated only against near-noiseless synthetic tests) to
+        # 1.5px, and now scaled per-observation by keypoint octave (see
+        # module docstring) rather than applied flat to every
+        # observation regardless of pyramid level. level_sigma2 (from
+        # extractor.py's own pyramid -- scale_factor^(2*octave), the
+        # same quantity ORB-SLAM3 itself uses for this) is optional:
+        # falls back to flat base_pixel_sigma for every observation if
+        # not given, so this stays a drop-in default for any caller that
+        # doesn't have an Extractor handy.
+        self.base_pixel_sigma = base_pixel_sigma
+        self.level_sigma2 = level_sigma2   # list indexed by octave, or None
+        self._stereo_noise_cache = {}   # octave -> noiseModel, built lazily
+        self._mono_noise_cache = {}
         self.anchor_noise = gtsam.noiseModel.Diagonal.Sigmas(
             np.array([anchor_sigma_pos] * 3 + [anchor_sigma_rot] * 3))
         # PHASE 9 BUGFIX (found, not anticipated -- see module docstring's
         # "on the odometry factor" section): odometry noise between
-        # consecutive keyframes.
-        self.odom_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([odom_sigma_rot] * 3 + [odom_sigma_pos] * 3))
+        # consecutive keyframes. POST-PHASE-9 FIX: these are now the
+        # BASE sigmas at a "healthy" tracked-point count
+        # (odom_confidence_ref_points); a keyframe that tracked fewer
+        # points gets a proportionally looser (larger-sigma) odometry
+        # factor instead of always asserting this same confidence -- see
+        # _odom_noise_for().
+        self.odom_sigma_pos = odom_sigma_pos
+        self.odom_sigma_rot = odom_sigma_rot
+        self.odom_confidence_ref_points = odom_confidence_ref_points
+        self.odom_confidence_max_scale = odom_confidence_max_scale
 
         self.kf_ids_in_graph = set()
         self.point_ids_in_graph = set()
@@ -156,8 +222,89 @@ class Isam2Backend:
         self._has_anchor = False
         self.n_updates = 0
         self.last_update_seconds = 0.0
+        # POST-PHASE-9 FIX: see _reset()'s docstring -- real-hardware
+        # testing showed a single IndeterminantLinearSystemException can
+        # otherwise cascade into permanent failure for the rest of a
+        # session, since nothing before this fix ever attempted recovery.
+        self._consecutive_failures = 0
+        self.reset_after_n_consecutive_failures = reset_after_n_consecutive_failures
+        self.n_resets = 0
 
-    def add_keyframe(self, keyframe, world_map, extra_factors=None):
+    def _stereo_noise_for_octave(self, octave):
+        if octave not in self._stereo_noise_cache:
+            sigma = self.base_pixel_sigma * self._octave_scale(octave)
+            self._stereo_noise_cache[octave] = gtsam.noiseModel.Robust.Create(
+                self.huber, gtsam.noiseModel.Isotropic.Sigma(3, sigma))
+        return self._stereo_noise_cache[octave]
+
+    def _mono_noise_for_octave(self, octave):
+        if octave not in self._mono_noise_cache:
+            sigma = self.base_pixel_sigma * self._octave_scale(octave)
+            self._mono_noise_cache[octave] = gtsam.noiseModel.Robust.Create(
+                self.huber, gtsam.noiseModel.Isotropic.Sigma(2, sigma))
+        return self._mono_noise_cache[octave]
+
+    def _octave_scale(self, octave):
+        if self.level_sigma2 is not None and 0 <= octave < len(self.level_sigma2):
+            return float(np.sqrt(self.level_sigma2[octave]))
+        return 1.0
+
+    def _odom_noise_for(self, n_tracked):
+        # POST-PHASE-9 FIX: see __init__ and module docstring. Fewer
+        # tracked points at this keyframe -> less confident relative-
+        # pose estimate -> proportionally looser odometry constraint,
+        # instead of a fixed sigma regardless of how marginal the
+        # tracking that produced it actually was.
+        scale = np.clip(self.odom_confidence_ref_points / max(n_tracked, 10),
+                        1.0, self.odom_confidence_max_scale)
+        sigmas = np.array([self.odom_sigma_rot * scale] * 3 +
+                          [self.odom_sigma_pos * scale] * 3)
+        return gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+
+    def _reset(self):
+        """
+        POST-PHASE-9 FIX: rebuild this backend's ISAM2 instance from
+        scratch. First real-hardware session (much noisier tracking than
+        any synthetic test in this phase produced) showed that once one
+        update fails with IndeterminantLinearSystemException, subsequent
+        updates can keep failing too -- whatever region of the graph
+        caused the first failure never gets corrected (GTSAM exposes no
+        "undo" or "force re-solve this region from scratch" operation
+        reachable from here), so the problem doesn't self-heal. Observed
+        directly: 90%+ of keyframes failing for the rest of a real
+        session after the first failure, zero recovery.
+
+        Rather than let this compound silently for an entire session,
+        after too many CONSECUTIVE failures this discards the whole
+        ISAM2 instance and starts a fresh one. Keyframes already
+        processed keep whatever pose they last held (their own tracking
+        estimate, or the last successful iSAM2 refinement) -- this phase
+        does not attempt to recover or re-derive anything for them, it
+        just stops trying to refine them further and starts rebuilding
+        forward from the keyframe that triggered the reset. That's a
+        real, documented loss (the early trajectory stops getting
+        iSAM2-refined), traded for the alternative observed on real
+        hardware being far worse (the WHOLE trajectory getting zero
+        refinement for the rest of the session).
+        """
+        params = gtsam.ISAM2Params()
+        params.setRelinearizeThreshold(self._relinearize_threshold)
+        params.relinearizeSkip = self._relinearize_skip
+        self.isam = gtsam.ISAM2(params)
+        self.kf_ids_in_graph = set()
+        self.point_ids_in_graph = set()
+        self._kf_objects = {}
+        self._has_anchor = False
+        self._prev_kf_id = None
+        self._consecutive_failures = 0
+        self.n_resets += 1
+        print(f"[iSAM2] REBUILDING this map's graph from scratch after "
+             f"{self.reset_after_n_consecutive_failures} consecutive update "
+             f"failures (reset #{self.n_resets}) -- see isam2_backend.py's "
+             f"_reset() docstring. Keyframes already processed keep their "
+             f"last-known pose; rebuilding forward from here.")
+
+    def add_keyframe(self, keyframe, world_map, extra_factors=None, _is_retry=False):
         """
         Incrementally add ONE new keyframe (must not already be in the
         graph) plus factors for its current observations of map points
@@ -170,6 +317,10 @@ class Isam2Backend:
         add in the SAME update() call (used for loop-closure factors --
         see add_loop_factor()) -- batching them into one call is why that
         method takes this argument rather than calling update() twice.
+
+        _is_retry: internal -- set when this call is itself the retry
+        performed by _reset() after too many consecutive failures, to
+        stop it from resetting again if the retry ALSO fails.
         """
         import time
         t_start = time.time()
@@ -199,11 +350,14 @@ class Isam2Backend:
             # "on the odometry factor" for why this is required, not
             # optional. Measurement is the tracking-estimated relative
             # pose (same quantity pose_graph.py's old scipy version
-            # trusted as an "odometry edge").
+            # trusted as an "odometry edge"). POST-PHASE-9 FIX: noise is
+            # now scaled by how well this keyframe actually tracked --
+            # see _odom_noise_for()'s docstring.
             prev_kf = self._kf_objects[self._prev_kf_id]
             T_rel = np.linalg.inv(prev_kf.pose) @ keyframe.pose
+            odom_noise = self._odom_noise_for(keyframe.n_tracked_points())
             graph.push_back(gtsam.BetweenFactorPose3(
-                X(self._prev_kf_id), X(keyframe.id), _pose3_from_np(T_rel), self.odom_noise))
+                X(self._prev_kf_id), X(keyframe.id), _pose3_from_np(T_rel), odom_noise))
 
         n_points_added, n_obs_added = 0, 0
         newly_added_point_ids = set()   # PHASE 9: committed to self.point_ids_in_graph
@@ -230,6 +384,12 @@ class Isam2Backend:
             # report for an in-range point (see local_mapping.py's
             # depth_max/th_depth for the sane working range).
             is_stereo = u_r is not None and (u - u_r) > 0.1
+            # Defensive: keyframe.keypoints should always exist on a real
+            # Frame, but degrade to octave 0 (flat noise) rather than
+            # raise if a caller ever hands in something keypoints-less.
+            kf_keypoints = getattr(keyframe, "keypoints", None)
+            octave = (kf_keypoints[kp_idx].octave
+                     if kf_keypoints is not None and kp_idx < len(kf_keypoints) else 0)
 
             if mp_id not in self.point_ids_in_graph and mp_id not in newly_added_point_ids:
                 # A brand-new landmark's FIRST-EVER factor must be
@@ -253,11 +413,11 @@ class Isam2Backend:
 
             if is_stereo:
                 graph.push_back(gtsam.GenericStereoFactor3D(
-                    StereoPoint2(u, u_r, v), self.stereo_noise,
+                    StereoPoint2(u, u_r, v), self._stereo_noise_for_octave(octave),
                     X(keyframe.id), L(mp_id), self.K_stereo))
             else:
                 graph.push_back(gtsam.GenericProjectionFactorCal3_S2(
-                    gtsam.Point2(u, v), self.mono_noise,
+                    gtsam.Point2(u, v), self._mono_noise_for_octave(octave),
                     X(keyframe.id), L(mp_id), self.K_mono))
             n_obs_added += 1
 
@@ -324,8 +484,24 @@ class Isam2Backend:
             # reconciliation just performed above).
             if kf_committed:
                 self._sync_back(world_map)
+
+            # POST-PHASE-9 FIX: see _reset()'s docstring -- a single
+            # failure used to just get logged and left the graph stuck,
+            # which on real hardware meant every SUBSEQUENT keyframe
+            # kept failing too, for the rest of the session. Track
+            # consecutive failures; past the threshold, rebuild the
+            # graph from scratch and retry THIS keyframe immediately
+            # against the clean instance, rather than waiting for
+            # another keyframe to trigger the same dead end.
+            self._consecutive_failures += 1
+            if (self._consecutive_failures >= self.reset_after_n_consecutive_failures
+                    and not _is_retry):
+                self._reset()
+                return self.add_keyframe(keyframe, world_map,
+                                         extra_factors=extra_factors, _is_retry=True)
             return n_points_added, n_obs_added, None
 
+        self._consecutive_failures = 0
         self.point_ids_in_graph |= newly_added_point_ids
         self.kf_ids_in_graph.add(keyframe.id)
         self._kf_objects[keyframe.id] = keyframe
