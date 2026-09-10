@@ -39,6 +39,8 @@ from keyframe_database import KeyFrameDatabase
 import relocalization
 import pose_graph
 import merge_maps
+import fusion
+import covisibility
 from loop_closing import LoopClosing
 import initializer
 from bundle_adjust import local_bundle_adjust, local_inertial_bundle_adjust, pose_only_optimize
@@ -52,6 +54,7 @@ except ImportError:
     local_bundle_adjust_gtsam = None
 import imu
 import imu_init
+from isam2_backend import Isam2Backend
 from config import load_config
 
 
@@ -125,6 +128,17 @@ class SLAMSystem:
 
         self.frames = []
         self.init_candidate = None
+        # PHASE 9: one Isam2Backend per Atlas map (mirrors the existing
+        # per-map tracking.set_map()/local_mapping.set_map() pattern),
+        # created lazily on that map's first keyframe. Only used for the
+        # VISUAL-ONLY path (backend config == "isam2" and IMU not yet
+        # initialized on this run) -- see the per-keyframe block in
+        # process() and this class's docstring-level notes on why IMU
+        # integration into this same graph is explicitly OUT of scope
+        # for this phase (Phase 8's local_inertial_bundle_adjust keeps
+        # handling the IMU-active case, unintegrated, until a later
+        # phase joins them).
+        self.isam2_backends = {}   # Map.id -> Isam2Backend
         self.consecutive_lost = 0
         self.stats = {'tracked': 0, 'lost': 0, 'keyframes': 0,
                       'points_created': 0, 'points_culled': 0, 'loops': 0,
@@ -171,6 +185,23 @@ class SLAMSystem:
                     self.keyframe_db.add_keyframe(frame)   # Phase 5
                     if self.use_imu:
                         self._start_imu_segment()
+                    # PHASE 9 BUGFIX: the init keyframe used to never
+                    # reach isam2_backend.py at all -- this whole branch
+                    # `return`s below, before the ordinary per-keyframe
+                    # block (where add_keyframe() normally gets called)
+                    # is ever reached. That meant the FIRST keyframe --
+                    # which local_mapping/init_rgbd anchors most of the
+                    # map's early points to -- was silently absent from
+                    # the graph, so whichever keyframe reached
+                    # add_keyframe() FIRST became the gauge anchor
+                    # instead, anchored at ITS OWN (not the true origin)
+                    # pose, with every point the true first keyframe
+                    # created inserted fresh, single-factor, in one large
+                    # batch. Found via a real IndeterminantLinearSystem-
+                    # Exception on a realistic multi-fragment synthetic
+                    # sequence -- see PROGRESS.md's Phase 9 section.
+                    if self.cfg["bundle_adjust"].get("backend", "scipy") == "isam2":
+                        self._get_isam2_backend(world_map).add_keyframe(frame, world_map)
                     self._log(f"[init] RGB-D success at frame {frame.id} "
                               f"({len(new_pts)} points)")
                 else:
@@ -194,6 +225,15 @@ class SLAMSystem:
                     self.keyframe_db.add_keyframe(frame)                 # Phase 5
                     if self.use_imu:
                         self._start_imu_segment()
+                    # PHASE 9 BUGFIX: same gap as the RGB-D init branch
+                    # above -- both init keyframes must be added, in
+                    # chronological order, so the FIRST one (not
+                    # whichever keyframe happens to reach the ordinary
+                    # per-keyframe block first) becomes the gauge anchor.
+                    if self.cfg["bundle_adjust"].get("backend", "scipy") == "isam2":
+                        isam2 = self._get_isam2_backend(world_map)
+                        isam2.add_keyframe(self.init_candidate, world_map)
+                        isam2.add_keyframe(frame, world_map)
                     self._log(f"[init] mono success at frame {frame.id} "
                               f"({len(new_pts)} points)")
                 else:
@@ -314,16 +354,33 @@ class SLAMSystem:
                 for kf_id in culled_ids:   # Phase 5: keep the inverted index consistent
                     self.keyframe_db.remove_keyframe(kf_id)
 
-            # Re-enabled: the old dense/unbounded BA is what was hanging.
-            # bundle_adjust.py now uses a bounded window, a sparse
-            # graph-colored Jacobian, and only optimizes points with >=2
-            # observations -- see that module's docstring for why this no
-            # longer hangs. Real-time isn't a priority here, so this is
-            # allowed to take however long it needs; it just won't grow
-            # unbounded with map size anymore.
+            # PHASE 9: real-time back end. The windowed local_bundle_
+            # adjust_gtsam()/local_bundle_adjust() batch calls below are
+            # RETIRED from this live per-keyframe path for the visual-
+            # only case -- replaced by one continuous incremental iSAM2
+            # graph (isam2_backend.py), which is what the real-time
+            # architecture reframe (PHASE7_ARCHITECTURE_V2_REALTIME.md)
+            # calls for and is now this project's default. They're kept
+            # in the codebase (not deleted) for comparison/fallback --
+            # select the old path via config["bundle_adjust"]["backend"]
+            # = "gtsam" or "scipy" instead of "isam2" if you need it.
+            #
+            # SCOPE BOUNDARY (explicit, not an oversight): IMU factors
+            # joining this SAME graph is deliberately NOT done this
+            # phase -- see PHASE7_ARCHITECTURE_V2_REALTIME.md's
+            # Workstream E, still future work. While IMU is active on a
+            # given run, Phase 8's local_inertial_bundle_adjust keeps
+            # handling optimization instead, exactly as it already did --
+            # the iSAM2 backend simply stops receiving new keyframes for
+            # that map once IMU takes over, so the two never fight over
+            # the same pose variables.
             n_kf = world_map.n_keyframes()
             if self.use_imu and not self.tracking.imu_initialized:
                 self._try_imu_init(world_map)
+
+            backend = self.cfg["bundle_adjust"].get("backend", "scipy")
+            use_isam2 = (backend == "isam2" and
+                        not (self.use_imu and self.tracking.imu_initialized))
 
             if self.use_imu and self.tracking.imu_initialized:
                 if n_kf >= 3:
@@ -331,12 +388,15 @@ class SLAMSystem:
                         world_map, self.camera, gravity=self.tracking.gravity,
                         bias_gyro=self.bias_gyro, bias_accel=self.bias_accel,
                         window=self.cfg["imu"]["ba_window"], verbose=self.verbose)
+            elif use_isam2:
+                isam2 = self._get_isam2_backend(world_map)
+                n_pts, n_obs, dt = isam2.add_keyframe(frame, world_map)
+                if self.verbose:
+                    print(f"[iSAM2] kf {frame.id}: +{n_pts} new pts, "
+                         f"+{n_obs} obs, update {dt*1000:.1f}ms "
+                         f"({isam2.n_updates} total updates)")
             elif n_kf >= 3:
-                # Phase 2: pick the BA backend from config. GTSAM path
-                # falls back to scipy with a warning if gtsam isn't
-                # installed or config asks for it incorrectly -- never
-                # silently no-ops bundle adjustment entirely.
-                backend = self.cfg["bundle_adjust"].get("backend", "scipy")
+                # gtsam/scipy fallback comparison path (backend != "isam2").
                 if backend == "gtsam" and local_bundle_adjust_gtsam is not None:
                     local_bundle_adjust_gtsam(world_map, self.camera,
                                               window=self.cfg["bundle_adjust"]["window"],
@@ -374,7 +434,17 @@ class SLAMSystem:
             # legitimate production design choice (bounding how often an
             # expensive Atlas-wide check runs), not something a
             # correctness test should be at the mercy of.
-            if n_kf % 10 == 0 and n_kf >= 20:
+            # PHASE 9: cadence is now configurable
+            # (loop_closing.check_every_n_kf), defaulting to 1 (every
+            # keyframe) -- the real-time reframe's own justification
+            # (PHASE7_ARCHITECTURE_V2_REALTIME.md sec 3/7): a slow-moving
+            # robot's keyframes are seconds apart, not the tight-real-
+            # time cadence the old hardcoded "every 10th" was designed
+            # for, so checking every keyframe is affordable. The
+            # `n_kf >= 20` warm-up guard stays -- no point checking
+            # before there's a meaningfully large map to match against.
+            check_every = self.cfg["loop_closing"].get("check_every_n_kf", 1)
+            if n_kf % check_every == 0 and n_kf >= 20:
                 result = self.loop_closer.detect_loop(frame, world_map)
                 if result is not None:
                     world_map = self._handle_loop_result(frame, world_map, result)
@@ -396,6 +466,38 @@ class SLAMSystem:
                 self.imu_preint.integrate_sample([gx, gy, gz], [ax, ay, az], t - t_prev)
             t_prev = t
         self._last_imu_t = t_prev
+
+    def _get_isam2_backend(self, world_map):
+        """PHASE 9: get-or-create this map's Isam2Backend instance."""
+        backend = self.isam2_backends.get(world_map.id)
+        if backend is None:
+            isam2_cfg = self.cfg.get("isam2", {})
+            backend = Isam2Backend(
+                self.camera,
+                virtual_baseline=self.cfg["bundle_adjust"].get("virtual_baseline", 0.05),
+                huber_f_scale=self.cfg["bundle_adjust"]["huber_f_scale"],
+                min_obs_to_optimize=self.cfg["bundle_adjust"]["min_obs_to_optimize"],
+                relinearize_threshold=isam2_cfg.get("relinearize_threshold", 0.1),
+                relinearize_skip=isam2_cfg.get("relinearize_skip", 1),
+                anchor_sigma_pos=isam2_cfg.get("anchor_sigma_pos", 1e-3),
+                anchor_sigma_rot=isam2_cfg.get("anchor_sigma_rot", 1e-2),
+                odom_sigma_pos=isam2_cfg.get("odom_sigma_pos", 0.05),
+                odom_sigma_rot=isam2_cfg.get("odom_sigma_rot", 0.05),
+                # POST-PHASE-9 FIX: see isam2_backend.py's module
+                # docstring -- these five are new, tuned against the
+                # first real D435i session rather than only synthetic
+                # data. level_sigma2 comes straight from this SLAM
+                # system's own extractor pyramid, so octave-scaled
+                # observation noise always matches whatever nfeatures/
+                # scale_factor/nlevels config is actually in use.
+                base_pixel_sigma=isam2_cfg.get("base_pixel_sigma", 1.5),
+                level_sigma2=self.extractor.level_sigma2,
+                odom_confidence_ref_points=isam2_cfg.get("odom_confidence_ref_points", 100),
+                odom_confidence_max_scale=isam2_cfg.get("odom_confidence_max_scale", 5.0),
+                reset_after_n_consecutive_failures=isam2_cfg.get(
+                    "reset_after_n_consecutive_failures", 3))
+            self.isam2_backends[world_map.id] = backend
+        return backend
 
     def _start_imu_segment(self):
         """Begin accumulating a fresh preintegration segment from the
@@ -434,21 +536,49 @@ class SLAMSystem:
         drift = self.loop_closer.measure_drift(frame, matched_kf)
         self.stats['loops'] += 1
 
+        # PHASE 9: same "is iSAM2 the active real-time back end right
+        # now" check used in process()'s per-keyframe block -- IMU-active
+        # runs still fall back to pose_graph.py's scipy correction (see
+        # that block's SCOPE BOUNDARY comment for why).
+        use_isam2 = (self.cfg["bundle_adjust"].get("backend", "scipy") == "isam2" and
+                    not (self.use_imu and self.tracking.imu_initialized))
+
         if matched_map is world_map:
             loop_edge = pose_graph.compute_loop_edge(
                 frame, matched_kf, self.matcher, self.camera, world_map)
             if loop_edge is not None:
                 T_rel, n_pnp_inliers = loop_edge
-                pg_stats = pose_graph.optimize_pose_graph(
-                    world_map, frame, matched_kf, T_rel,
-                    loop_weight=min(100.0, n_pnp_inliers),
-                    camera=self.camera, covis_graph=self.local_mapping.covis_graph,
-                    extractor=self.extractor, verbose=self.verbose)
-                self._log(f"[LOOP] kf {frame.id} <-> kf {matched_kf.id} "
-                          f"(same map) | sim={sim:.3f} inliers={inliers} | "
-                          f"drift={drift:.3f}m -> CORRECTED "
-                          f"({pg_stats['n_keyframes_corrected'] if pg_stats else 0} kfs, "
-                          f"{pg_stats['n_points_corrected'] if pg_stats else 0} pts)")
+                if use_isam2:
+                    isam2 = self._get_isam2_backend(world_map)
+                    dt = isam2.add_loop_factor(
+                        matched_kf, frame, T_rel, loop_weight=min(100.0, n_pnp_inliers),
+                        world_map=world_map)
+                    # Loop-seam fusion, same as pose_graph.py always did
+                    # (these two keyframes were never naturally covisible
+                    # before the loop closed) -- iSAM2 corrects POSES via
+                    # the factor above, but doesn't discover duplicate
+                    # points across the seam by itself.
+                    n_levels = self.extractor.nlevels
+                    scale_factor = self.extractor.scale_factor
+                    ad_hoc_graph = {matched_kf.id: {frame.id: 999}, frame.id: {matched_kf.id: 999}}
+                    n_fused = fusion.search_in_neighbors(frame, world_map, ad_hoc_graph, self.camera,
+                                                         n_levels=n_levels, scale_factor=scale_factor)
+                    covisibility.build_covisibility_graph(world_map, graph=self.local_mapping.covis_graph)
+                    self._log(f"[LOOP] kf {frame.id} <-> kf {matched_kf.id} "
+                              f"(same map) | sim={sim:.3f} inliers={inliers} | "
+                              f"drift={drift:.3f}m -> "
+                              f"{'CORRECTED via iSAM2 (' + str(round(dt*1000,1)) + 'ms, ' + str(n_fused) + ' fused)' if dt is not None else 'iSAM2 update FAILED (see [iSAM2] WARNING above) -- pose left uncorrected this round'}")
+                else:
+                    pg_stats = pose_graph.optimize_pose_graph(
+                        world_map, frame, matched_kf, T_rel,
+                        loop_weight=min(100.0, n_pnp_inliers),
+                        camera=self.camera, covis_graph=self.local_mapping.covis_graph,
+                        extractor=self.extractor, verbose=self.verbose)
+                    self._log(f"[LOOP] kf {frame.id} <-> kf {matched_kf.id} "
+                              f"(same map) | sim={sim:.3f} inliers={inliers} | "
+                              f"drift={drift:.3f}m -> CORRECTED "
+                              f"({pg_stats['n_keyframes_corrected'] if pg_stats else 0} kfs, "
+                              f"{pg_stats['n_points_corrected'] if pg_stats else 0} pts)")
             else:
                 self._log(f"[LOOP] kf {frame.id} <-> kf {matched_kf.id} "
                           f"(same map) | drift={drift:.3f}m -> correction "
@@ -467,10 +597,30 @@ class SLAMSystem:
         # separate map -- everything downstream of this point needs to
         # operate on matched_map, the survivor. Mirrors relocalization.py's
         # own post-switch bookkeeping exactly.
+        absorbed_kfs = list(world_map.keyframes)   # merge_maps leaves this list intact -- see its docstring
         world_map = matched_map
         self.tracking.set_map(world_map)
         self.local_mapping.set_map(world_map)
         self.tracking.covis_graph = self.local_mapping.covis_graph
+
+        if use_isam2:
+            # PHASE 9: bring the absorbed map's keyframes into the
+            # SURVIVOR'S iSAM2 graph -- absorb_map() connects the first
+            # one via bridge_kf (matched_kf, already in this graph) so
+            # it's never left as a disconnected component (see
+            # isam2_backend.py's absorb_map() docstring), then this
+            # explicit add_loop_factor() call afterward adds the REAL,
+            # PnP-measured transform between the actual matched pair as
+            # a tighter constraint -- the bridge only prevents a crash,
+            # this is what actually pulls the seam tight.
+            isam2 = self._get_isam2_backend(world_map)
+            isam2.absorb_map(absorbed_kfs, world_map, bridge_kf=matched_kf)
+            # anchor_kf_a (frame) and anchor_kf_b (matched_kf) both now
+            # live in world_map's coordinate frame post-merge.
+            T_rel_bridge = np.linalg.inv(matched_kf.pose) @ frame.pose
+            isam2.add_loop_factor(matched_kf, frame, T_rel_bridge,
+                                  loop_weight=min(100.0, inliers), world_map=world_map)
+
         self._log(f"[LOOP] kf {frame.id} <-> kf {matched_kf.id} "
                   f"(CROSS-MAP) | sim={sim:.3f} inliers={inliers} | "
                   f"drift={drift:.3f}m -> MERGED "
@@ -719,8 +869,10 @@ def run_realsense(args):
     t0 = time.time()
     processed_count = 0
     frame_counter = 0
-    pending_ir_clean = None   # holds the last emitter-off IR frame while we wait for the paired depth
-    last_process_t = None     # PHASE 8: wall-clock cursor for slicing IMU samples per process() call
+    pending_ir_clean = None      # holds the last emitter-off IR frame while we wait for the paired depth
+    pending_ir_clean_ts = None   # POST-PHASE-9 FIX: that frame's own device timestamp, paired with it
+    last_process_t_raw = None    # POST-PHASE-9 FIX: RAW device-clock cursor for IMU slicing (see below)
+    device_t0 = None             # POST-PHASE-9 FIX: device-clock baseline, set from the first processed frame
 
     try:
         while processed_count < total_target_frames:
@@ -736,7 +888,7 @@ def run_realsense(args):
                     if f.is_motion_frame():
                         mf = f.as_motion_frame()
                         md = mf.get_motion_data()
-                        ts = mf.get_timestamp() / 1000.0   # ms -> s, global clock
+                        ts = mf.get_timestamp() / 1000.0   # ms -> s, RAW device/global clock
                         stream = "accel" if mf.get_profile().stream_type() == rs.stream.accel else "gyro"
                         raw = np.array([ts, md.x, md.y, md.z])
                         (slam._live_accel_buf if stream == "accel"
@@ -756,13 +908,20 @@ def run_realsense(args):
                 if emitter_on:
                     if pending_ir_clean is not None and depth:
                         color_img = pending_ir_clean
+                        # POST-PHASE-9 FIX: use the CLEAN frame's own
+                        # device timestamp (captured when it was stored
+                        # below), not this later emitter-on frame's --
+                        # this is the frame actually being processed.
+                        frame_ts_raw = pending_ir_clean_ts
                         depth_img = np.asanyarray(depth.get_data()) if not args.mono else None
                         pending_ir_clean = None
+                        pending_ir_clean_ts = None
                     else:
                         frame_counter += 1
                         continue
                 else:
                     pending_ir_clean = np.asanyarray(ir.get_data())
+                    pending_ir_clean_ts = ir.get_timestamp() / 1000.0
                     frame_counter += 1
                     continue
             else:
@@ -773,11 +932,38 @@ def run_realsense(args):
                     continue
                 frame_counter += 1
                 color_img = np.asanyarray(color.get_data())
+                frame_ts_raw = color.get_timestamp() / 1000.0
                 depth_img = np.asanyarray(depth.get_data()) if (depth and not args.mono) else None
 
             processed_count += 1
             print(f"Processing target frame {processed_count}/{total_target_frames}")
-            this_t = time.time() - t0
+
+            # POST-PHASE-9 FIX (found from a real hardware session, not
+            # synthetic): this used to be `this_t = time.time() - t0` --
+            # the HOST's own wall clock, started at pipeline setup. IMU
+            # motion-frame timestamps, both here and in record.py, come
+            # from `frame.get_timestamp()` -- the DEVICE's own clock
+            # (global_time_enabled puts every sensor on one shared clock,
+            # but that clock is the device's, not `time.time()`'s). Those
+            # two clocks are NOT the same epoch, so `imu.slice_between()`
+            # comparing a tiny host-relative `this_t` against large
+            # device-clock IMU timestamps was silently selecting zero (or
+            # near-zero) rows on almost every call -- confirmed directly:
+            # a 30+ second live session with `--imu` never accumulated
+            # enough samples to pass imu_init.py's observability gate,
+            # for the ENTIRE session, regardless of how long it ran.
+            # record.py never had this bug because it uses
+            # `frame.get_timestamp()` for the SAVED video timestamp too
+            # (see that file) -- this now matches that proven pattern:
+            # both video and IMU timestamps come from the same device
+            # clock. `device_t0` is just a cosmetic offset (first frame's
+            # raw device timestamp) so the numbers handed to
+            # slam.process() and printed in logs start near zero, same as
+            # before -- it's applied uniformly, so it doesn't change any
+            # elapsed-time math anywhere downstream.
+            if device_t0 is None:
+                device_t0 = frame_ts_raw
+            this_t = frame_ts_raw - device_t0
 
             imu_samples = None
             if args.imu:
@@ -790,18 +976,23 @@ def run_realsense(args):
                 # context on both sides of the window to avoid edge
                 # artifacts, and imu.slice_between already does the exact
                 # windowing we need on the synchronized result.
+                #
+                # POST-PHASE-9 FIX: slicing bounds are now in the SAME
+                # raw device-clock terms as the buffered IMU samples
+                # themselves (see above) -- `lo_raw`/`frame_ts_raw`, not
+                # the device_t0-shifted `this_t`.
                 sync = imu.synchronize(
                     {"accel": np.asarray(slam._live_accel_buf) if slam._live_accel_buf else np.zeros((0, 4)),
                      "gyro": np.asarray(slam._live_gyro_buf) if slam._live_gyro_buf else np.zeros((0, 4))},
                     R_cam_imu=R_cam_imu)
-                lo = last_process_t if last_process_t is not None else this_t - (1.0 / args.fps)
-                imu_samples = imu.slice_between(sync, lo, this_t)
+                lo_raw = last_process_t_raw if last_process_t_raw is not None else frame_ts_raw - (1.0 / args.fps)
+                imu_samples = imu.slice_between(sync, lo_raw, frame_ts_raw)
                 # Trim buffers so they don't grow for the whole session --
-                # keep a small tail before `lo` for the next interpolation.
-                keep_from = lo - 0.05
+                # keep a small tail before `lo_raw` for the next interpolation.
+                keep_from = lo_raw - 0.05
                 slam._live_accel_buf = [r for r in slam._live_accel_buf if r[0] >= keep_from]
                 slam._live_gyro_buf = [r for r in slam._live_gyro_buf if r[0] >= keep_from]
-                last_process_t = this_t
+                last_process_t_raw = frame_ts_raw
 
             slam.process(color_img, this_t, depth_image=depth_img, imu_samples=imu_samples)
 
